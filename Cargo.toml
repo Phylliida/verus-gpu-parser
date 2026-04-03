@@ -1,0 +1,12 @@
+[package]
+name = "verus-gpu-parser"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "verus-gpu-transpile"
+path = "src/main.rs"
+
+[dependencies]
+tree-sitter = "0.25"
+tree-sitter-verus = { path = "../tree-sitter-verus" }
