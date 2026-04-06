@@ -429,11 +429,14 @@ fn emit_function_single(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usiz
     }
     s.push_str(&format!("fn {}({}) -> {} {{\n", fn_display_name, param_strs.join(", "), ret_ty));
 
-    // Local variables
+    // Local variables — skip params and special names to avoid redefinition
+    let param_names: std::collections::HashSet<&str> = f.params.iter()
+        .map(|(name, _)| name.as_str()).collect();
     let param_count = f.params.len();
     for i in param_count..f.var_names.len() {
         let vn = &f.var_names[i];
         if vn == "_ret" || vn == "_call_tmp" || vn == "out" { continue; }
+        if param_names.contains(vn.as_str()) { continue; }
         s.push_str(&format!("  var {}: u32;\n", vn));
     }
     s.push_str(&format!("  var _ret: {};\n", ret_ty));
