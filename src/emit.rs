@@ -315,59 +315,57 @@ fn emit_stmt_ctx(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
     }
 }
 
-/// Try to decompose a ScratchWrite offset into a local array write.
-/// Matches pattern `Var(vec_param) + idx_expr` where vec_param maps to a local buffer.
-/// Returns Some((array_access_str, idx_str, val_str)) if matched.
+/// Try to decompose a ScratchWrite offset into a buffer/local/scalar write.
+/// Matches pattern `Var(vec_param) + idx_expr` where vec_param is in vec_buf_map.
+/// Returns Some((write_target_str, idx_str, val_str)) if matched.
 fn try_decompose_local_write(
     offset: &Expr, val: &Expr,
     var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction],
     vec_buf_map: &[(String, String)],
     _is_depth: bool,
 ) -> Option<(String, String, String)> {
-    // Pattern: BinOp(Add, Var(vec_param), idx_expr) where vec_param is local
+    // Pattern: BinOp(Add, Var(vec_param), idx_expr) where vec_param has a buffer mapping
     if let Expr::BinOp(BinOp::Add, lhs, rhs) = offset {
         if let Expr::Var(var_id) = lhs.as_ref() {
             let vn = var_name(var_names, *var_id);
             if let Some((_, buf)) = vec_buf_map.iter().find(|(p, _)| p == &vn) {
-                if is_local_buf(buf) {
-                    let idx_str = emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map);
-                    let val_str = emit_expr_ctx(val, var_names, buf_decls, funcs, vec_buf_map);
-                    let access = if is_kernel_local(buf) {
-                        format!("{}[{}]", vn, idx_str)
-                    } else {
-                        format!("(*{})[{}]", vn, idx_str)
-                    };
-                    return Some((access, idx_str, val_str));
-                }
+                let idx_str = emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map);
+                let val_str = emit_expr_ctx(val, var_names, buf_decls, funcs, vec_buf_map);
+                let access = if is_kernel_local(buf) {
+                    format!("{}[{}]", vn, idx_str)
+                } else if is_local_buf(buf) {
+                    format!("(*{})[{}]", vn, idx_str)
+                } else {
+                    // Regular buffer (wg_mem, scratch, etc.)
+                    format!("{}[({} + {})]", buf, vn, idx_str)
+                };
+                return Some((access, idx_str, val_str));
             }
         }
     }
-    // Pattern: just Var(scalar_var) — skipped scalar write
+    // Pattern: just Var(scalar_var) — skipped scalar or single-element write
     if let Expr::Var(var_id) = offset {
         let vn = var_name(var_names, *var_id);
         if let Some((_, buf)) = vec_buf_map.iter().find(|(p, _)| p == &vn) {
+            let val_str = emit_expr_ctx(val, var_names, buf_decls, funcs, vec_buf_map);
             if buf == "__kscalar" {
-                let val_str = emit_expr_ctx(val, var_names, buf_decls, funcs, vec_buf_map);
                 return Some((vn, "0u".to_string(), val_str));
+            } else if is_kernel_local(buf) {
+                return Some((format!("{}[0u]", vn), "0u".to_string(), val_str));
+            } else if is_local_buf(buf) {
+                return Some((format!("(*{})[0u]", vn), "0u".to_string(), val_str));
             }
-            if is_local_buf(buf) {
-                let val_str = emit_expr_ctx(val, var_names, buf_decls, funcs, vec_buf_map);
-                let access = if is_kernel_local(buf) {
-                    format!("{}[0u]", vn)
-                } else {
-                    format!("(*{})[0u]", vn)
-                };
-                return Some((access, "0u".to_string(), val_str));
-            }
+            // For non-local buffers, don't decompose single-var offsets
+            // (they're actual offsets into the buffer, not a param name)
         }
     }
     None
 }
 
-/// Try to decompose a ScratchRead/ArrayRead offset into a local array read or scalar read.
+/// Try to decompose a ScratchRead/ArrayRead offset into a buffer/local/scalar read.
 /// Matches:
-///   - `Var(local_array) + idx_expr` → `local_array[idx]` or `(*local_array)[idx]`
-///   - `Var(skipped_scalar)` → just `skipped_scalar` (direct variable access)
+///   - `Var(param) + idx_expr` where param is in vec_buf_map → appropriate access
+///   - `Var(skipped_scalar)` → just the variable name
 fn try_decompose_local_read(
     offset: &Expr,
     var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction],
@@ -377,14 +375,15 @@ fn try_decompose_local_read(
         if let Expr::Var(var_id) = lhs.as_ref() {
             let vn = var_name(var_names, *var_id);
             if let Some((_, buf)) = vec_buf_map.iter().find(|(p, _)| p == &vn) {
-                if is_local_buf(buf) {
-                    let idx_str = emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map);
-                    return Some(if is_kernel_local(buf) {
-                        format!("{}[{}]", vn, idx_str)
-                    } else {
-                        format!("(*{})[{}]", vn, idx_str)
-                    });
-                }
+                let idx_str = emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map);
+                return Some(if is_kernel_local(buf) {
+                    format!("{}[{}]", vn, idx_str)
+                } else if is_local_buf(buf) {
+                    format!("(*{})[{}]", vn, idx_str)
+                } else {
+                    // Regular buffer
+                    format!("{}[({} + {})]", buf, vn, idx_str)
+                });
             }
         }
     }
@@ -392,15 +391,11 @@ fn try_decompose_local_read(
         let vn = var_name(var_names, *var_id);
         if let Some((_, buf)) = vec_buf_map.iter().find(|(p, _)| p == &vn) {
             if buf == "__kscalar" {
-                // Skipped scalar var: direct variable access
                 return Some(vn);
-            }
-            if is_local_buf(buf) {
-                return Some(if is_kernel_local(buf) {
-                    format!("{}[0u]", vn)
-                } else {
-                    format!("(*{})[0u]", vn)
-                });
+            } else if is_kernel_local(buf) {
+                return Some(format!("{}[0u]", vn));
+            } else if is_local_buf(buf) {
+                return Some(format!("(*{})[0u]", vn));
             }
         }
     }
