@@ -1,8 +1,9 @@
 ///  WGSL emitter — plain Rust version mirroring the verified emitter.
 ///  Structural correspondence with wgsl_emit.rs ensures correctness.
-///  Now supports helper function emission and function calls.
+///  Supports helper functions, function calls, and tuple types (as WGSL structs).
 
 use crate::types::*;
+use std::collections::BTreeSet;
 
 fn binop_str(op: &BinOp) -> &'static str {
     match op {
@@ -31,6 +32,19 @@ fn scalar_type_str(ty: &ScalarType) -> &'static str {
         ScalarType::I32 => "i32", ScalarType::U32 => "u32",
         ScalarType::F32 => "f32", ScalarType::F16 => "f16",
         ScalarType::Bool => "bool",
+    }
+}
+
+/// Generate a WGSL struct name for a tuple of given arity, e.g. "R2", "R4", "R5", "R8".
+fn tuple_struct_name(arity: usize) -> String {
+    format!("R{}", arity)
+}
+
+/// Generate the WGSL return type string for a ReturnType.
+fn return_type_str(rt: &ReturnType) -> String {
+    match rt {
+        ReturnType::Scalar(ty) => scalar_type_str(ty).to_string(),
+        ReturnType::Tuple(types) => tuple_struct_name(types.len()),
     }
 }
 
@@ -77,6 +91,16 @@ pub fn emit_expr(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs: &
                 .collect();
             format!("{}({})", name, arg_strs.join(", "))
         },
+        Expr::TupleConstruct(elems) => {
+            let arity = elems.len();
+            let elem_strs: Vec<String> = elems.iter()
+                .map(|e| emit_expr(e, var_names, buf_decls, funcs))
+                .collect();
+            format!("{}({})", tuple_struct_name(arity), elem_strs.join(", "))
+        },
+        Expr::TupleAccess(base, idx) => {
+            format!("{}._{}", emit_expr(base, var_names, buf_decls, funcs), idx)
+        },
     }
 }
 
@@ -97,6 +121,14 @@ pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
                 .collect();
             format!("{}{} = {}({});\n", pad, var_name(var_names, *result_var),
                     name, arg_strs.join(", "))
+        },
+        Stmt::TupleDestructure { vars, rhs } => {
+            // let (a, b, c) = expr; → var __tmp = expr; a = __tmp._0; b = __tmp._1; ...
+            let mut s = format!("{}var __td = {};\n", pad, emit_expr(rhs, var_names, buf_decls, funcs));
+            for (i, var) in vars.iter().enumerate() {
+                s.push_str(&format!("{}{} = __td._{};\n", pad, var_name(var_names, *var), i));
+            }
+            s
         },
         Stmt::Seq { first, then } => {
             let mut s = emit_stmt(first, var_names, buf_decls, funcs, depth);
@@ -135,11 +167,91 @@ pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
     }
 }
 
+/// Collect all tuple arities used in the kernel and its functions.
+fn collect_tuple_arities(k: &Kernel) -> BTreeSet<usize> {
+    let mut arities = BTreeSet::new();
+    for f in &k.functions {
+        if let Some(ReturnType::Tuple(types)) = &f.ret_type {
+            arities.insert(types.len());
+        }
+        collect_arities_from_stmt(&f.body, &mut arities);
+    }
+    collect_arities_from_stmt(&k.body, &mut arities);
+    arities
+}
+
+fn collect_arities_from_stmt(s: &Stmt, arities: &mut BTreeSet<usize>) {
+    match s {
+        Stmt::Assign { rhs, .. } => collect_arities_from_expr(rhs, arities),
+        Stmt::BufWrite { idx, val, .. } => {
+            collect_arities_from_expr(idx, arities);
+            collect_arities_from_expr(val, arities);
+        },
+        Stmt::CallStmt { args, .. } => {
+            for a in args { collect_arities_from_expr(a, arities); }
+        },
+        Stmt::TupleDestructure { rhs, .. } => collect_arities_from_expr(rhs, arities),
+        Stmt::Seq { first, then } => {
+            collect_arities_from_stmt(first, arities);
+            collect_arities_from_stmt(then, arities);
+        },
+        Stmt::If { cond, then_body, else_body } => {
+            collect_arities_from_expr(cond, arities);
+            collect_arities_from_stmt(then_body, arities);
+            collect_arities_from_stmt(else_body, arities);
+        },
+        Stmt::For { start, end, body, .. } => {
+            collect_arities_from_expr(start, arities);
+            collect_arities_from_expr(end, arities);
+            collect_arities_from_stmt(body, arities);
+        },
+        _ => {},
+    }
+}
+
+fn collect_arities_from_expr(e: &Expr, arities: &mut BTreeSet<usize>) {
+    match e {
+        Expr::TupleConstruct(elems) => {
+            arities.insert(elems.len());
+            for el in elems { collect_arities_from_expr(el, arities); }
+        },
+        Expr::TupleAccess(base, _) => collect_arities_from_expr(base, arities),
+        Expr::BinOp(_, a, b) => {
+            collect_arities_from_expr(a, arities);
+            collect_arities_from_expr(b, arities);
+        },
+        Expr::UnaryOp(_, a) => collect_arities_from_expr(a, arities),
+        Expr::Select(c, t, f) => {
+            collect_arities_from_expr(c, arities);
+            collect_arities_from_expr(t, arities);
+            collect_arities_from_expr(f, arities);
+        },
+        Expr::ArrayRead(_, idx) => collect_arities_from_expr(idx, arities),
+        Expr::Cast(_, inner) => collect_arities_from_expr(inner, arities),
+        Expr::Call(_, args) => {
+            for a in args { collect_arities_from_expr(a, arities); }
+        },
+        _ => {},
+    }
+}
+
+/// Emit a WGSL struct definition for a tuple of given arity.
+fn emit_tuple_struct(arity: usize) -> String {
+    let mut s = format!("struct {} {{\n", tuple_struct_name(arity));
+    for i in 0..arity {
+        s.push_str(&format!("  _{}: u32,\n", i));
+    }
+    s.push_str("}\n\n");
+    s
+}
+
 /// Emit a helper function as WGSL.
 fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction]) -> String {
     let mut s = String::new();
 
-    let ret_ty = f.ret_type.map(|t| scalar_type_str(&t)).unwrap_or("u32");
+    let ret_ty = f.ret_type.as_ref()
+        .map(|rt| return_type_str(rt))
+        .unwrap_or_else(|| "u32".to_string());
 
     // Signature
     let param_strs: Vec<String> = f.params.iter()
@@ -147,28 +259,34 @@ fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction]) -> String {
         .collect();
     s.push_str(&format!("fn {}({}) -> {} {{\n", f.name, param_strs.join(", "), ret_ty));
 
-    // Declare local variables (skip params, they're declared in signature)
+    // Declare local variables (skip params)
     let param_count = f.params.len();
     for i in param_count..f.var_names.len() {
         let vn = &f.var_names[i];
-        if vn == "__ret" { continue; } // declared as return value
-        s.push_str(&format!("  var {}: {};\n", vn, ret_ty));
+        if vn == "__ret" || vn == "__call_tmp" { continue; }
+        s.push_str(&format!("  var {}: u32;\n", vn));
     }
 
     // Return value
     s.push_str(&format!("  var __ret: {};\n", ret_ty));
 
-    // Body — use empty buf_decls since helpers don't access buffers directly
+    // Body
     let empty_bufs: Vec<BufDecl> = Vec::new();
     s.push_str(&emit_stmt(&f.body, &f.var_names, &empty_bufs, all_funcs, 1));
 
-    s.push_str(&format!("  return __ret;\n"));
+    s.push_str("  return __ret;\n");
     s.push_str("}\n\n");
     s
 }
 
 pub fn emit_kernel(k: &Kernel) -> String {
     let mut s = String::new();
+
+    // Tuple struct definitions
+    let arities = collect_tuple_arities(k);
+    for arity in &arities {
+        s.push_str(&emit_tuple_struct(*arity));
+    }
 
     // Buffer declarations
     for buf in &k.buf_decls {
@@ -178,7 +296,7 @@ pub fn emit_kernel(k: &Kernel) -> String {
     }
     s.push('\n');
 
-    // Helper functions (emitted before the kernel entry point)
+    // Helper functions
     for f in &k.functions {
         s.push_str(&emit_function(f, &k.functions));
     }
@@ -194,7 +312,7 @@ pub fn emit_kernel(k: &Kernel) -> String {
         s.push_str(&format!("  let {} = {};\n", var_name(&k.var_names, i as u32), bn));
     }
 
-    // Declare local variables (skip builtins and buffer names)
+    // Declare local variables
     let builtin_count = k.builtin_names.len();
     let buf_names: Vec<&str> = k.buf_decls.iter().map(|b| b.name.as_str()).collect();
     for i in builtin_count..k.var_names.len() {

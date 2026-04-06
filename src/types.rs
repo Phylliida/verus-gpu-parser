@@ -33,6 +33,8 @@ pub enum Expr {
     ArrayRead(u32, Box<Expr>),
     Cast(ScalarType, Box<Expr>),
     Call(u32, Vec<Expr>),           // fn_id, args → returns value
+    TupleConstruct(Vec<Expr>),      // (a, b, c, ...) → struct construction
+    TupleAccess(Box<Expr>, u32),    // expr.0, expr.1, ... → member access
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +42,8 @@ pub enum Stmt {
     Assign { var: u32, rhs: Expr },
     BufWrite { buf: u32, idx: Expr, val: Expr },
     CallStmt { fn_id: u32, args: Vec<Expr>, result_var: u32 },
+    /// let (a, b, c) = expr; → destructure tuple into multiple vars
+    TupleDestructure { vars: Vec<u32>, rhs: Expr },
     Seq { first: Box<Stmt>, then: Box<Stmt> },
     If { cond: Expr, then_body: Box<Stmt>, else_body: Box<Stmt> },
     For { var: u32, start: Expr, end: Expr, body: Box<Stmt> },
@@ -71,12 +75,19 @@ pub struct BufDecl {
     pub elem_type: ScalarType,
 }
 
+/// Return type: either a single scalar or a tuple of scalars.
+#[derive(Debug, Clone)]
+pub enum ReturnType {
+    Scalar(ScalarType),
+    Tuple(Vec<ScalarType>),
+}
+
 /// A helper function callable from the kernel or other helpers.
 #[derive(Debug, Clone)]
 pub struct GpuFunction {
     pub name: String,
     pub params: Vec<(String, ScalarType)>,  // (name, type)
-    pub ret_type: Option<ScalarType>,
+    pub ret_type: Option<ReturnType>,
     pub var_names: Vec<String>,
     pub body: Stmt,
     pub ret_var: u32,                       // local holding return value

@@ -294,20 +294,32 @@ fn infer_scalar_type(param_text: &str) -> ScalarType {
 }
 
 /// Parse return type from function signature.
-fn parse_return_type(fn_node: &Node, source: &str) -> Option<ScalarType> {
+fn parse_return_type(fn_node: &Node, source: &str) -> Option<ReturnType> {
     let text = fn_node.utf8_text(source.as_bytes()).unwrap_or("");
     // Look for "-> TYPE" pattern before the body "{"
     if let Some(arrow_pos) = text.find("->") {
         let after = &text[arrow_pos + 2..];
         let ty_text = after.split(|c: char| c == '{' || c == '\n')
             .next().unwrap_or("").trim();
+
+        // Check for tuple return type: (u32, u32, u32, ...)
+        if ty_text.starts_with('(') && ty_text.ends_with(')') && !ty_text.contains(':') {
+            let inner = &ty_text[1..ty_text.len()-1];
+            let types: Vec<ScalarType> = inner.split(',')
+                .map(|s| infer_scalar_type(s.trim()))
+                .collect();
+            if types.len() > 1 {
+                return Some(ReturnType::Tuple(types));
+            }
+        }
+
         // Strip Verus return name pattern: (name: Type)
         let ty_text = if ty_text.starts_with('(') && ty_text.contains(':') {
             ty_text.split(':').last().unwrap_or("").trim().trim_end_matches(')')
         } else {
             ty_text
         };
-        return Some(infer_scalar_type(ty_text));
+        return Some(ReturnType::Scalar(infer_scalar_type(ty_text)));
     }
     None
 }
@@ -522,10 +534,29 @@ fn parse_if_as_return(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
 }
 
 fn parse_let(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
-    let name = node.child_by_field_name("pattern")
-        .map(|n| ctx.text(&n).to_string())
+    let pattern_node = node.child_by_field_name("pattern");
+    let pattern_text = pattern_node.map(|n| ctx.text(&n).to_string())
         .unwrap_or_else(|| "tmp".to_string());
-    let name = name.strip_prefix("mut ").unwrap_or(&name).trim().to_string();
+
+    // Check for tuple destructuring: let (a, b, c) = expr
+    if pattern_text.starts_with('(') && pattern_text.ends_with(')') {
+        let inner = &pattern_text[1..pattern_text.len()-1];
+        let names: Vec<String> = inner.split(',')
+            .map(|s| s.trim().strip_prefix("mut ").unwrap_or(s.trim()).to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let vars: Vec<u32> = names.iter().map(|n| ctx.var_idx(n)).collect();
+
+        let rhs = if let Some(val) = node.child_by_field_name("value") {
+            parse_expr(&val, ctx)?
+        } else {
+            Expr::Const(0, ScalarType::I32)
+        };
+
+        return Ok(Stmt::TupleDestructure { vars, rhs });
+    }
+
+    let name = pattern_text.strip_prefix("mut ").unwrap_or(&pattern_text).trim().to_string();
     let var = ctx.var_idx(&name);
 
     let rhs = if let Some(val) = node.child_by_field_name("value") {
@@ -780,9 +811,44 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
                 Ok(Expr::Var(ctx.var_idx(base_text)))
             }
         },
-        "parenthesized_expression" => {
-            let inner = node.child(1).ok_or("paren missing inner")?;
-            parse_expr(&inner, ctx)
+        "parenthesized_expression" | "tuple_expression" => {
+            // Could be (expr) or (a, b, c, ...)
+            let mut cursor = node.walk();
+            let children: Vec<Node> = node.children(&mut cursor).collect();
+            let mut elems: Vec<Expr> = Vec::new();
+            let mut has_comma = false;
+            for child in &children {
+                match child.kind() {
+                    "(" | ")" => {},
+                    "," => { has_comma = true; },
+                    _ => elems.push(parse_expr(child, ctx)?),
+                }
+            }
+            if has_comma || elems.len() > 1 {
+                // Tuple: (a, b, c, ...)
+                Ok(Expr::TupleConstruct(elems))
+            } else if elems.len() == 1 {
+                // Parenthesized expression: (expr)
+                Ok(elems.remove(0))
+            } else {
+                Ok(Expr::Const(0, ScalarType::U32))
+            }
+        },
+        "field_expression" => {
+            // expr.field — could be tuple access (expr.0, expr.1) or struct field
+            let base = node.child(0).ok_or("field missing base")?;
+            let field = node.child(2)
+                .or_else(|| node.child_by_field_name("field"))
+                .ok_or("field missing field name")?;
+            let field_text = ctx.text(&field);
+            // If field is a number, it's a tuple access
+            if let Ok(idx) = field_text.parse::<u32>() {
+                let base_expr = parse_expr(&base, ctx)?;
+                Ok(Expr::TupleAccess(Box::new(base_expr), idx))
+            } else {
+                // Struct field — treat as variable for now
+                Ok(Expr::Var(ctx.var_idx(ctx.text(node))))
+            }
         },
         "type_cast_expression" | "as_expression" => {
             let inner = node.child(0).ok_or("cast missing inner")?;
