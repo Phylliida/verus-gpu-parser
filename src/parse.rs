@@ -223,6 +223,11 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
 fn populate_vec_buffer_maps(body: &Stmt, buf_decls: &[BufDecl], functions: &mut Vec<GpuFunction>) {
     match body {
         Stmt::Assign { rhs, .. } => scan_expr_for_buf_calls(rhs, buf_decls, functions),
+        Stmt::CallStmt { fn_id, args, .. } => {
+            // Treat as a Call expression for scanning
+            let call_expr = Expr::Call(*fn_id, args.clone());
+            scan_expr_for_buf_calls(&call_expr, buf_decls, functions);
+        },
         Stmt::TupleDestructure { rhs, .. } => scan_expr_for_buf_calls(rhs, buf_decls, functions),
         Stmt::Seq { first, then } => {
             populate_vec_buffer_maps(first, buf_decls, functions);
@@ -246,17 +251,28 @@ fn scan_expr_for_buf_calls(expr: &Expr, buf_decls: &[BufDecl], functions: &mut V
                 let vec_params: Vec<String> = func.vec_params.clone();
                 let mut mappings: Vec<(String, String)> = Vec::new();
 
-                // Match BufSlice args to Vec params
-                let mut vec_param_idx = 0;
-                for arg in args {
-                    if let Expr::BufSlice(buf_id, _) = arg {
-                        if vec_param_idx < vec_params.len() {
-                            let buf_name = buf_decls.get(*buf_id as usize)
-                                .map(|b| b.name.clone())
-                                .unwrap_or_else(|| format!("buf_{}", buf_id));
-                            mappings.push((vec_params[vec_param_idx].clone(), buf_name));
-                            vec_param_idx += 1;
-                        }
+                // Collect all BufSlice args
+                let buf_slices: Vec<(u32, &Expr)> = args.iter()
+                    .filter_map(|a| if let Expr::BufSlice(buf_id, offset) = a {
+                        Some((*buf_id, offset.as_ref()))
+                    } else { None })
+                    .collect();
+
+                // First N BufSlices map to Vec params (inputs)
+                for (i, (buf_id, _)) in buf_slices.iter().enumerate() {
+                    if i < vec_params.len() {
+                        let buf_name = buf_decls.get(*buf_id as usize)
+                            .map(|b| b.name.clone())
+                            .unwrap_or_else(|| format!("buf_{}", buf_id));
+                        mappings.push((vec_params[i].clone(), buf_name));
+                    } else {
+                        // Extra BufSlice args map to output Vecs
+                        // Convention: output Vec is named "out" (from Vec::new() in body)
+                        let buf_name = buf_decls.get(*buf_id as usize)
+                            .map(|b| b.name.clone())
+                            .unwrap_or_else(|| format!("buf_{}", buf_id));
+                        mappings.push(("out".to_string(), buf_name));
+                        functions[fn_idx].returns_vec = true;
                     }
                 }
 
@@ -1172,10 +1188,17 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
             Ok(Expr::Select(Box::new(cond), Box::new(then_expr), Box::new(else_expr)))
         },
         "reference_expression" | "borrow_expression" => {
-            // &expr or &mut expr
-            let inner = node.child(1)
-                .or_else(|| node.child(2)) // &mut has an extra child
-                .ok_or("reference missing inner")?;
+            // &expr or &mut expr — find the actual inner expression (skip & and mut tokens)
+            let mut inner_opt = None;
+            let mut cursor_ref = node.walk();
+            for child in node.children(&mut cursor_ref) {
+                let ck = child.kind();
+                if ck != "&" && ck != "mut" && ck != "mutable_specifier" {
+                    inner_opt = Some(child);
+                    break;
+                }
+            }
+            let inner = inner_opt.ok_or("reference missing inner")?;
 
             // Check for buffer slice: &buf[offset..] or &mut buf[offset..]
             if inner.kind() == "index_expression" {

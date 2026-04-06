@@ -1,5 +1,6 @@
-/// Test kernel that calls verified generic_add_limbs from verus-fixed-point.
-/// The transpiler follows `use` imports and transpiles the function directly.
+/// Test kernel calling verified generic_add_limbs with buffer-backed Vecs.
+/// Input Vecs: &a_buf[base..], &b_buf[base..]
+/// Output Vec: &mut out_buf[base..] (extra arg maps to the returned Vec)
 
 use verus_fixed_point::fixed_point::limb_ops::*;
 
@@ -13,9 +14,6 @@ fn test_add_buffers(
     let n = 4u32;
     let base = tid * n;
 
-    let (result, carry) = generic_add_limbs(&a_buf[base..], &b_buf[base..], n);
-
-    for i in 0u32..n {
-        out_buf[base + i] = result[i];
-    }
+    // Call generic_add_limbs: a_buf → input a, b_buf → input b, out_buf → output Vec
+    let carry = generic_add_limbs(&a_buf[base..], &b_buf[base..], n, &mut out_buf[base..]);
 }

@@ -143,9 +143,25 @@ pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
 fn emit_stmt_ctx(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction], depth: usize, vec_buf_map: &[(String, String)]) -> String {
     let pad = "  ".repeat(depth);
     match s {
-        Stmt::Assign { var, rhs } =>
-            format!("{}{} = {};\n", pad, var_name(var_names, *var),
-                    emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map)),
+        Stmt::Assign { var, rhs } => {
+            let vn = var_name(var_names, *var);
+            // When assigning to __ret and rhs is a tuple with a Vec element,
+            // and we have an output buffer, extract just the scalar part.
+            if vn == "__ret" {
+                if let Expr::TupleConstruct(elems) = rhs {
+                    // Check if any element is a Vec var (mapped to buffer)
+                    let has_output_vec = !vec_buf_map.is_empty() &&
+                        vec_buf_map.iter().any(|(name, _)| name == "out");
+                    if has_output_vec && elems.len() == 2 {
+                        // (out_vec, scalar) → just assign scalar to __ret
+                        return format!("{}{} = {};\n", pad, vn,
+                            emit_expr_ctx(&elems[1], var_names, buf_decls, funcs, vec_buf_map));
+                    }
+                }
+            }
+            format!("{}{} = {};\n", pad, vn,
+                    emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map))
+        },
         Stmt::BufWrite { buf, idx, val } =>
             format!("{}{}[{}] = {};\n", pad, buf_name(buf_decls, *buf),
                     emit_expr_ctx(idx, var_names, buf_decls, funcs, vec_buf_map),
@@ -312,9 +328,15 @@ fn emit_tuple_struct(arity: usize) -> String {
 fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction]) -> String {
     let mut s = String::new();
 
-    let ret_ty = f.ret_type.as_ref()
-        .map(|rt| return_type_str(rt))
-        .unwrap_or_else(|| "u32".to_string());
+    // When returns_vec: the Vec part is written to an output buffer,
+    // so the return type is scalar only (strip Vec from tuple).
+    let ret_ty = if f.returns_vec {
+        "u32".to_string() // just the scalar carry
+    } else {
+        f.ret_type.as_ref()
+            .map(|rt| return_type_str(rt))
+            .unwrap_or_else(|| "u32".to_string())
+    };
 
     // Build monomorphized name: fn_name + buffer names for Vec params
     let fn_display_name = if f.vec_buffer_map.is_empty() {
@@ -327,19 +349,23 @@ fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction]) -> String {
     };
 
     // Signature — Vec params become offset parameters (u32)
-    let param_strs: Vec<String> = f.params.iter()
+    let mut param_strs: Vec<String> = f.params.iter()
         .map(|(name, ty)| match ty {
             ParamType::Scalar(sty) => format!("{}: {}", name, scalar_type_str(sty)),
             ParamType::VecU32 => format!("{}: u32", name), // offset into buffer
         })
         .collect();
+    // Add output offset parameter if function returns Vec
+    if f.returns_vec {
+        param_strs.push("out: u32".to_string());
+    }
     s.push_str(&format!("fn {}({}) -> {} {{\n", fn_display_name, param_strs.join(", "), ret_ty));
 
-    // Declare local variables (skip params)
+    // Declare local variables (skip params and output-vec vars)
     let param_count = f.params.len();
     for i in param_count..f.var_names.len() {
         let vn = &f.var_names[i];
-        if vn == "__ret" || vn == "__call_tmp" { continue; }
+        if vn == "__ret" || vn == "__call_tmp" || vn == "out" { continue; }
         s.push_str(&format!("  var {}: u32;\n", vn));
     }
 
