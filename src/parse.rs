@@ -21,6 +21,8 @@ struct ParseCtx<'a> {
     fn_name_to_id: HashMap<String, u32>,
     /// Names of functions called (collected during parsing for reachability).
     called_fns: HashSet<String>,
+    /// Variables that are Vec-typed (mapped to scratch buffer on GPU).
+    vec_vars: HashSet<String>,
 }
 
 impl<'a> ParseCtx<'a> {
@@ -85,6 +87,7 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         builtin_names: Vec::new(),
         fn_name_to_id: HashMap::new(),
         called_fns: HashSet::new(),
+        vec_vars: HashSet::new(),
     };
 
     let name = kernel_fn_node.child_by_field_name("name")
@@ -130,6 +133,7 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
                 builtin_names: Vec::new(),
                 fn_name_to_id: ctx.fn_name_to_id.clone(),
                 called_fns: HashSet::new(),
+        vec_vars: HashSet::new(),
             };
             if let Some(params) = fn_node.child_by_field_name("parameters") {
                 parse_helper_parameters(&params, &mut helper_ctx);
@@ -181,6 +185,7 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         builtin_names: Vec::new(),
         fn_name_to_id: fn_id_map.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         called_fns: HashSet::new(),
+        vec_vars: HashSet::new(),
     };
 
     if let Some(params) = kernel_fn_node.child_by_field_name("parameters") {
@@ -204,6 +209,7 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         builtin_names: final_ctx.builtin_names,
         functions,
         fn_name_to_id: fn_name_to_id_vec,
+        scratch_size: 0,
     })
 }
 
@@ -228,6 +234,7 @@ fn discover_callees_from_source(
         builtin_names: Vec::new(),
         fn_name_to_id: parent_ctx.fn_name_to_id.clone(),
         called_fns: HashSet::new(),
+        vec_vars: HashSet::new(),
     };
     if let Some(params) = fn_node.child_by_field_name("parameters") {
         parse_helper_parameters(&params, &mut helper_ctx);
@@ -302,6 +309,7 @@ fn parse_helper_function(
         builtin_names: Vec::new(),
         fn_name_to_id: fn_id_map.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         called_fns: HashSet::new(),
+        vec_vars: HashSet::new(),
     };
 
     let name = fn_node.child_by_field_name("name")
@@ -326,10 +334,21 @@ fn parse_helper_function(
         Stmt::Noop
     };
 
+    let vec_params: Vec<String> = params.iter()
+        .filter(|(_, ty)| matches!(ty, ParamType::VecU32))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let returns_vec = match &ret_type {
+        Some(ReturnType::Tuple(_)) => false, // TODO: detect Vec in tuple returns
+        _ => false,
+    };
+
     Ok(GpuFunction {
         name,
         params,
         ret_type,
+        vec_params,
+        returns_vec,
         var_names: ctx.var_names,
         body,
         ret_var,
@@ -337,7 +356,7 @@ fn parse_helper_function(
 }
 
 /// Parse parameters as typed variables (for helper functions, not kernel).
-fn parse_typed_parameters(params_node: &Node, ctx: &mut ParseCtx) -> Vec<(String, ScalarType)> {
+fn parse_typed_parameters(params_node: &Node, ctx: &mut ParseCtx) -> Vec<(String, ParamType)> {
     let mut result = Vec::new();
     let mut cursor = params_node.walk();
     let children: Vec<Node> = params_node.children(&mut cursor).collect();
@@ -346,9 +365,15 @@ fn parse_typed_parameters(params_node: &Node, ctx: &mut ParseCtx) -> Vec<(String
         if child.kind() == "parameter" {
             let name = extract_param_name(child, ctx.source);
             let text = ctx.text(child);
-            let ty = infer_scalar_type(text);
+            // Detect Vec<u32> or &Vec<u32> parameters
+            let param_type = if text.contains("Vec<") || text.contains("Vec <") {
+                ctx.vec_vars.insert(name.clone());
+                ParamType::VecU32
+            } else {
+                ParamType::Scalar(infer_scalar_type(text))
+            };
             ctx.var_idx(&name);
-            result.push((name, ty));
+            result.push((name, param_type));
         }
     }
     result

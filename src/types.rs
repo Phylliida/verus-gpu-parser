@@ -35,6 +35,10 @@ pub enum Expr {
     Call(u32, Vec<Expr>),           // fn_id, args → returns value
     TupleConstruct(Vec<Expr>),      // (a, b, c, ...) → struct construction
     TupleAccess(Box<Expr>, u32),    // expr.0, expr.1, ... → member access
+    /// Read from scratch buffer: scratch[offset_expr]
+    ScratchRead(Box<Expr>),
+    /// Read from scratch at vec_var's offset + index: scratch[vec_off + idx]
+    VecIndex(u32, Box<Expr>),       // (vec_var_id, index_expr)
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +48,10 @@ pub enum Stmt {
     CallStmt { fn_id: u32, args: Vec<Expr>, result_var: u32 },
     /// let (a, b, c) = expr; → destructure tuple into multiple vars
     TupleDestructure { vars: Vec<u32>, rhs: Expr },
+    /// Write to scratch buffer: scratch[offset_expr] = val
+    ScratchWrite { offset: Expr, val: Expr },
+    /// Vec push: scratch[vec_off + vec_len] = val; vec_len++
+    VecPush { vec_var: u32, val: Expr },
     Seq { first: Box<Stmt>, then: Box<Stmt> },
     If { cond: Expr, then_body: Box<Stmt>, else_body: Box<Stmt> },
     For { var: u32, start: Expr, end: Expr, body: Box<Stmt> },
@@ -75,6 +83,15 @@ pub struct BufDecl {
     pub elem_type: ScalarType,
 }
 
+/// Parameter type: scalar or Vec (buffer-backed array region).
+#[derive(Debug, Clone)]
+pub enum ParamType {
+    Scalar(ScalarType),
+    /// Vec<u32> parameter — on GPU, this maps to an offset into the scratch buffer.
+    /// The function receives `name_off: u32` and accesses `scratch[name_off + i]`.
+    VecU32,
+}
+
 /// Return type: either a single scalar or a tuple of scalars.
 #[derive(Debug, Clone)]
 pub enum ReturnType {
@@ -86,11 +103,16 @@ pub enum ReturnType {
 #[derive(Debug, Clone)]
 pub struct GpuFunction {
     pub name: String,
-    pub params: Vec<(String, ScalarType)>,  // (name, type)
+    pub params: Vec<(String, ParamType)>,   // (name, type)
     pub ret_type: Option<ReturnType>,
+    /// Names of params that are Vec<u32> (for scratch buffer mapping).
+    pub vec_params: Vec<String>,
+    /// If the function returns a Vec<u32> as part of its return type,
+    /// the caller provides an output scratch offset as an extra parameter.
+    pub returns_vec: bool,
     pub var_names: Vec<String>,
     pub body: Stmt,
-    pub ret_var: u32,                       // local holding return value
+    pub ret_var: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -103,4 +125,7 @@ pub struct Kernel {
     pub builtin_names: Vec<String>,
     pub functions: Vec<GpuFunction>,        // helper functions (reachable from kernel)
     pub fn_name_to_id: Vec<(String, u32)>,  // name → index into functions
+    /// Size of workgroup scratch buffer (for Vec-backed operations).
+    /// If > 0, emits `var<workgroup> scratch: array<u32, SIZE>;`
+    pub scratch_size: u32,
 }

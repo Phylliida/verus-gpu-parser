@@ -101,6 +101,13 @@ pub fn emit_expr(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs: &
         Expr::TupleAccess(base, idx) => {
             format!("{}._{}", emit_expr(base, var_names, buf_decls, funcs), idx)
         },
+        Expr::ScratchRead(offset) => {
+            format!("scratch[{}]", emit_expr(offset, var_names, buf_decls, funcs))
+        },
+        Expr::VecIndex(var, idx) => {
+            format!("scratch[({} + {})]", var_name(var_names, *var),
+                    emit_expr(idx, var_names, buf_decls, funcs))
+        },
     }
 }
 
@@ -165,6 +172,18 @@ pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
             };
             format!("{}{};\n", pad, name)
         },
+        Stmt::ScratchWrite { offset, val } => {
+            format!("{}scratch[{}] = {};\n", pad,
+                    emit_expr(offset, var_names, buf_decls, funcs),
+                    emit_expr(val, var_names, buf_decls, funcs))
+        },
+        Stmt::VecPush { vec_var, val } => {
+            let vn = var_name(var_names, *vec_var);
+            let len_var = format!("{}_len", vn);
+            format!("{}scratch[({} + {})] = {};\n{}{} = {} + 1u;\n",
+                    pad, vn, len_var, emit_expr(val, var_names, buf_decls, funcs),
+                    pad, len_var, len_var)
+        },
         Stmt::Return => format!("{}return;\n", pad),
         Stmt::Noop => String::new(),
     }
@@ -194,6 +213,11 @@ fn collect_arities_from_stmt(s: &Stmt, arities: &mut BTreeSet<usize>) {
             for a in args { collect_arities_from_expr(a, arities); }
         },
         Stmt::TupleDestructure { rhs, .. } => collect_arities_from_expr(rhs, arities),
+        Stmt::ScratchWrite { offset, val } => {
+            collect_arities_from_expr(offset, arities);
+            collect_arities_from_expr(val, arities);
+        },
+        Stmt::VecPush { val, .. } => collect_arities_from_expr(val, arities),
         Stmt::Seq { first, then } => {
             collect_arities_from_stmt(first, arities);
             collect_arities_from_stmt(then, arities);
@@ -234,6 +258,8 @@ fn collect_arities_from_expr(e: &Expr, arities: &mut BTreeSet<usize>) {
         Expr::Call(_, args) => {
             for a in args { collect_arities_from_expr(a, arities); }
         },
+        Expr::ScratchRead(offset) => collect_arities_from_expr(offset, arities),
+        Expr::VecIndex(_, idx) => collect_arities_from_expr(idx, arities),
         _ => {},
     }
 }
@@ -256,9 +282,12 @@ fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction]) -> String {
         .map(|rt| return_type_str(rt))
         .unwrap_or_else(|| "u32".to_string());
 
-    // Signature
+    // Signature — Vec params become offset parameters (u32)
     let param_strs: Vec<String> = f.params.iter()
-        .map(|(name, ty)| format!("{}: {}", name, scalar_type_str(ty)))
+        .map(|(name, ty)| match ty {
+            ParamType::Scalar(sty) => format!("{}: {}", name, scalar_type_str(sty)),
+            ParamType::VecU32 => format!("{}: u32", name), // offset into scratch
+        })
         .collect();
     s.push_str(&format!("fn {}({}) -> {} {{\n", f.name, param_strs.join(", "), ret_ty));
 
@@ -289,6 +318,11 @@ pub fn emit_kernel(k: &Kernel) -> String {
     let arities = collect_tuple_arities(k);
     for arity in &arities {
         s.push_str(&emit_tuple_struct(*arity));
+    }
+
+    // Scratch buffer (workgroup shared memory for Vec-backed operations)
+    if k.scratch_size > 0 {
+        s.push_str(&format!("var<workgroup> scratch: array<u32, {}>;\n\n", k.scratch_size));
     }
 
     // Buffer declarations
