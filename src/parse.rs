@@ -48,7 +48,7 @@ impl<'a> ParseCtx<'a> {
             | "if" | "else" | "for" | "while" | "break" | "continue" | "switch" | "loop"
             | "struct" | "enum" | "type" | "const" | "override" | "diagnostic" | "enable"
             | "alias" | "bitcast" | "discard" | "fallthrough" | "default" | "case"
-            | "target" | "texture" | "sampler" | "ptr" | "ref" | "function" | "private"
+            | "target" | "texture" | "sampler" | "ptr" | "ref" | "function" | "private" | "shared"
             | "workgroup" | "uniform" | "storage" | "handle" | "read" | "write" | "read_write"
             | "array" | "atomic" | "mat2x2" | "mat3x3" | "mat4x4" | "vec2" | "vec3" | "vec4"
             | "bool" | "f16" | "f32" | "i32" | "u32"
@@ -1257,11 +1257,32 @@ fn parse_parameters(params_node: &Node, ctx: &mut ParseCtx) {
                 let builtin = if attr_text.contains("thread_id_x") { "gid.x" }
                     else if attr_text.contains("thread_id_y") { "gid.y" }
                     else if attr_text.contains("thread_id_z") { "gid.z" }
-                    else if attr_text.contains("workgroup_id_x") { "gid.x" }
-                    else if attr_text.contains("local_id_x") { "gid.x" }
+                    else if attr_text.contains("workgroup_id_x") { "wid.x" }
+                    else if attr_text.contains("workgroup_id_y") { "wid.y" }
+                    else if attr_text.contains("workgroup_id_z") { "wid.z" }
+                    else if attr_text.contains("local_id_x") { "lid.x" }
+                    else if attr_text.contains("local_id_y") { "lid.y" }
+                    else if attr_text.contains("local_id_z") { "lid.z" }
+                    else if attr_text.contains("num_workgroups_x") { "nwg.x" }
+                    else if attr_text.contains("num_workgroups_y") { "nwg.y" }
                     else { "gid.x" };
                 ctx.builtin_names.push(builtin.to_string());
                 ctx.var_idx(&name);
+            } else if attr_text.contains("gpu_shared") {
+                // Workgroup shared memory: #[gpu_shared(SIZE)]
+                // Emits var<workgroup> name: array<u32, SIZE>;
+                let size = attr_text.split('(').nth(1)
+                    .and_then(|s| s.split(')').next())
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                // Add as a buffer with a special marker
+                let binding = ctx.buf_decls.len() as u32;
+                ctx.buf_decls.push(BufDecl {
+                    binding: 1000 + size, // sentinel: 1000+ means shared memory, value encodes size
+                    name,
+                    read_only: false,
+                    elem_type: ScalarType::U32,
+                });
             } else if attr_text.contains("gpu_buffer") {
                 let read_only = !attr_text.contains("read_write");
                 let binding = ctx.buf_decls.len() as u32;
@@ -1548,7 +1569,7 @@ fn parse_expr_to_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
 
         let lhs_text = ctx.text(&lhs_node);
 
-        // Buffer write: buf[idx] = val
+        // Buffer write or vec var write: x[idx] = val
         if lhs_node.kind() == "index_expression" {
             let buf_name_str = lhs_node.child(0)
                 .map(|n| ctx.text(&n).to_string())
@@ -1560,6 +1581,21 @@ fn parse_expr_to_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
                 let idx = parse_expr(&idx_node, ctx)?;
                 let val = parse_expr(&rhs_node, ctx)?;
                 return Ok(Stmt::BufWrite { buf, idx, val });
+            }
+            // Vec var index write: vec_var[idx] = val → ScratchWrite
+            if ctx.vec_vars.contains(&buf_name_str) {
+                let vec_var = ctx.var_idx(&buf_name_str);
+                let idx_node = lhs_node.child(2)
+                    .or_else(|| lhs_node.child_by_field_name("index"))
+                    .ok_or("vec write missing index")?;
+                let idx = parse_expr(&idx_node, ctx)?;
+                let val = parse_expr(&rhs_node, ctx)?;
+                return Ok(Stmt::ScratchWrite {
+                    offset: Expr::BinOp(BinOp::Add,
+                        Box::new(Expr::Var(vec_var)),
+                        Box::new(idx)),
+                    val,
+                });
             }
         }
 

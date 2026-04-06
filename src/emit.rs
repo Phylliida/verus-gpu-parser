@@ -887,7 +887,16 @@ pub fn emit_kernel(k: &Kernel) -> String {
         kernel_vec_buf_map.push((name.clone(), "__kscalar".to_string()));
     }
 
-    // Buffer declarations (skip synthetic __local_ buffers and unused buffers)
+    // Workgroup shared memory declarations (binding >= 1000)
+    for buf in &k.buf_decls {
+        if buf.binding >= 1000 {
+            let size = buf.binding - 1000;
+            s.push_str(&format!("var<workgroup> {}: array<{}, {}>;\n",
+                buf.name, scalar_type_str(&buf.elem_type), size));
+        }
+    }
+
+    // Buffer declarations (skip synthetic __local_ buffers, shared memory, and unused buffers)
     // First emit all functions to a temp string so we can check buffer usage
     let mut func_str = String::new();
     for (i, f) in k.functions.iter().enumerate() {
@@ -897,6 +906,7 @@ pub fn emit_kernel(k: &Kernel) -> String {
 
     for buf in &k.buf_decls {
         if is_local_buf(&buf.name) { continue; }
+        if buf.binding >= 1000 { continue; } // shared memory, already emitted above
         // Check if the buffer name appears in any emitted function or kernel body
         let buf_ref = format!("{}[", buf.name);
         let used = func_str.contains(&buf_ref) || kernel_body_str.contains(&buf_ref);
@@ -912,11 +922,17 @@ pub fn emit_kernel(k: &Kernel) -> String {
 
     // (Helper functions already emitted above via func_str)
 
-    // Entry point
+    // Entry point — declare builtins based on what's used
     s.push_str(&format!("@compute @workgroup_size({}, {}, {})\n",
         k.workgroup_size.0, k.workgroup_size.1, k.workgroup_size.2));
-    s.push_str(&format!("fn {}(\n  @builtin(global_invocation_id) gid: vec3<u32>,\n) {{\n",
-        k.name));
+    let uses_lid = k.builtin_names.iter().any(|b| b.starts_with("lid."));
+    let uses_wid = k.builtin_names.iter().any(|b| b.starts_with("wid."));
+    let uses_nwg = k.builtin_names.iter().any(|b| b.starts_with("nwg."));
+    let mut params_list = vec!["@builtin(global_invocation_id) gid: vec3<u32>".to_string()];
+    if uses_lid { params_list.push("@builtin(local_invocation_id) lid: vec3<u32>".to_string()); }
+    if uses_wid { params_list.push("@builtin(workgroup_id) wid: vec3<u32>".to_string()); }
+    if uses_nwg { params_list.push("@builtin(num_workgroups) nwg: vec3<u32>".to_string()); }
+    s.push_str(&format!("fn {}(\n  {},\n) {{\n", k.name, params_list.join(",\n  ")));
 
     // Builtin extraction
     for (i, bn) in k.builtin_names.iter().enumerate() {
