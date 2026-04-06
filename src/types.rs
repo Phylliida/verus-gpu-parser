@@ -137,4 +137,10 @@ pub struct Kernel {
     /// Size of workgroup scratch buffer (for Vec-backed operations).
     /// If > 0, emits `var<workgroup> scratch: array<u32, SIZE>;`
     pub scratch_size: u32,
+    /// Variables annotated with #[gpu_local(N)] — stored as thread-local
+    /// arrays instead of scratch buffer offsets. (var_name, array_size)
+    pub local_arrays: Vec<(String, u32)>,
+    /// Variables annotated with #[gpu_skip] — offset computations suppressed,
+    /// treated as plain scalar variables (e.g., sign values).
+    pub skipped_vars: Vec<String>,
 }

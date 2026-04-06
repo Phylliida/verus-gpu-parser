@@ -23,6 +23,11 @@ struct ParseCtx<'a> {
     called_fns: HashSet<String>,
     /// Variables that are Vec-typed (mapped to scratch buffer on GPU).
     vec_vars: HashSet<String>,
+    /// Variables annotated with #[gpu_local(N)] — thread-local arrays.
+    /// Maps var_name → array_size.
+    local_arrays: HashMap<String, u32>,
+    /// Variables annotated with #[gpu_skip] — treated as plain scalars.
+    skipped_vars: HashSet<String>,
 }
 
 impl<'a> ParseCtx<'a> {
@@ -108,6 +113,8 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         fn_name_to_id: HashMap::new(),
         called_fns: HashSet::new(),
         vec_vars: HashSet::new(),
+        local_arrays: HashMap::new(),
+        skipped_vars: HashSet::new(),
     };
 
     let name = kernel_fn_node.child_by_field_name("name")
@@ -154,6 +161,8 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
                 fn_name_to_id: ctx.fn_name_to_id.clone(),
                 called_fns: HashSet::new(),
         vec_vars: HashSet::new(),
+        local_arrays: HashMap::new(),
+        skipped_vars: HashSet::new(),
             };
             if let Some(params) = fn_node.child_by_field_name("parameters") {
                 parse_helper_parameters(&params, &mut helper_ctx);
@@ -224,6 +233,8 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         fn_name_to_id: fn_id_map.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         called_fns: HashSet::new(),
         vec_vars: HashSet::new(),
+        local_arrays: HashMap::new(),
+        skipped_vars: HashSet::new(),
     };
 
     if let Some(params) = kernel_fn_node.child_by_field_name("parameters") {
@@ -261,6 +272,11 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
 
     let fn_name_to_id_vec: Vec<(String, u32)> = fn_id_map.into_iter().collect();
 
+    let local_arrays: Vec<(String, u32)> = final_ctx.local_arrays.iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let skipped_vars: Vec<String> = final_ctx.skipped_vars.iter().cloned().collect();
+
     Ok(Kernel {
         name,
         var_names: final_ctx.var_names,
@@ -271,6 +287,8 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         functions,
         fn_name_to_id: fn_name_to_id_vec,
         scratch_size: 0,
+        local_arrays,
+        skipped_vars,
     })
 }
 
@@ -896,6 +914,8 @@ fn discover_callees_from_source(
         fn_name_to_id: parent_ctx.fn_name_to_id.clone(),
         called_fns: HashSet::new(),
         vec_vars: HashSet::new(),
+        local_arrays: HashMap::new(),
+        skipped_vars: HashSet::new(),
     };
     if let Some(params) = fn_node.child_by_field_name("parameters") {
         parse_helper_parameters(&params, &mut helper_ctx);
@@ -971,6 +991,8 @@ fn parse_helper_function(
         fn_name_to_id: fn_id_map.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         called_fns: HashSet::new(),
         vec_vars: HashSet::new(),
+        local_arrays: HashMap::new(),
+        skipped_vars: HashSet::new(),
     };
 
     let name = fn_node.child_by_field_name("name")
@@ -1073,6 +1095,25 @@ fn parse_helper_parameters(params_node: &Node, ctx: &mut ParseCtx) {
             ctx.var_idx(&name);
         }
     }
+}
+
+/// Parse `// #[gpu_local(N)]` annotation from a comment line.
+/// Returns Some(N) if found, None otherwise.
+fn parse_gpu_local_size(comment: &str) -> Option<u32> {
+    let trimmed = comment.trim().trim_start_matches("//").trim();
+    if let Some(rest) = trimmed.strip_prefix("#[gpu_local(") {
+        if let Some(num_str) = rest.strip_suffix(")]") {
+            return num_str.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Check if comment contains `// #[gpu_skip]` — suppresses the next let assignment.
+/// Used for sign offset variables (e.g., `let re2_sign = re2 + n;`) that become
+/// plain u32 vars when their array counterpart is local.
+fn is_gpu_skip(comment: &str) -> bool {
+    comment.trim().trim_start_matches("//").trim() == "#[gpu_skip]"
 }
 
 /// Infer scalar type from parameter text like "x: u32" or "a: i32".
@@ -1258,18 +1299,61 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
         .find(|c| c.kind() != "}" && c.kind() != "{")
         .map(|c| c.id());
 
+    // Track pending #[gpu_local(N)] / #[gpu_skip] annotation from comment
+    let mut pending_gpu_local: Option<u32> = None;
+    let mut pending_gpu_skip = false;
+
     for child in &children {
         let kind = child.kind();
         let is_last = Some(child.id()) == last_meaningful;
         match kind {
             "{" | "}" => {},
+            "line_comment" => {
+                let text = ctx.text(child);
+                if let Some(size) = parse_gpu_local_size(text) {
+                    pending_gpu_local = Some(size);
+                } else if is_gpu_skip(text) {
+                    pending_gpu_skip = true;
+                }
+            },
             "let_declaration" => {
                 // Skip ghost/proof let bindings
                 let text = ctx.text(child);
                 if text.contains("ghost ") || text.contains("Ghost") {
+                    pending_gpu_local = None;
                     continue;
                 }
-                stmts.push(parse_let(child, ctx)?);
+                // If preceded by #[gpu_local(N)] or #[gpu_skip], handle specially
+                let gpu_local_size = pending_gpu_local.take();
+                let gpu_skip = pending_gpu_skip;
+                pending_gpu_skip = false;
+                let stmt = parse_let(child, ctx)?;
+                if gpu_skip {
+                    // Suppress offset assignment — variable stays as plain scalar u32.
+                    // Track the var name so scratch reads/writes using it are rewritten.
+                    if let Some(pat) = child.child_by_field_name("pattern") {
+                        let name = ctx.text(&pat)
+                            .strip_prefix("mut ").unwrap_or(ctx.text(&pat))
+                            .trim().to_string();
+                        ctx.skipped_vars.insert(name);
+                    }
+                    stmts.push(Stmt::Noop);
+                } else if let Some(size) = gpu_local_size {
+                    // Extract the variable name from the let declaration
+                    if let Some(pat) = child.child_by_field_name("pattern") {
+                        let name = ctx.text(&pat)
+                            .strip_prefix("mut ").unwrap_or(ctx.text(&pat))
+                            .trim().to_string();
+                        ctx.local_arrays.insert(name.clone(), size);
+                        // Ensure it's also registered as a Vec var
+                        ctx.vec_vars.insert(name.clone());
+                        eprintln!("  [gpu_local] {} → array<u32, {}>", name, size);
+                    }
+                    // Suppress the offset assignment — local arrays don't need scratch offsets
+                    stmts.push(Stmt::Noop);
+                } else {
+                    stmts.push(stmt);
+                }
             },
             "expression_statement" => stmts.push(parse_expr_stmt(child, ctx)?),
             "if_expression" => {
@@ -1281,8 +1365,8 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
                     stmts.push(parse_if(child, ctx)?);
                 }
             },
-            "for_expression" => stmts.push(parse_for(child, ctx)?),
-            "while_expression" => stmts.push(parse_while(child, ctx)?),
+            "for_expression" => { pending_gpu_local = None; pending_gpu_skip = false; stmts.push(parse_for(child, ctx)?); },
+            "while_expression" => { pending_gpu_local = None; pending_gpu_skip = false; stmts.push(parse_while(child, ctx)?); },
             "return_expression" => {
                 // return expr → assign to __ret + Return
                 let mut cursor2 = child.walk();
@@ -1817,9 +1901,57 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
                             .map(|n| parse_expr(&n, ctx))
                             .transpose()?
                             .unwrap_or(Expr::Const(0, ScalarType::U32));
+
+                        // Check if the range start is a local array variable.
+                        // E.g., &scratch[zr..] where zr is annotated #[gpu_local(4)]
+                        // → redirect to local synthetic buffer instead of scratch.
+                        if let Expr::Var(var_id) = &range_start {
+                            let var_nm = ctx.var_names.get(*var_id as usize)
+                                .cloned().unwrap_or_default();
+                            if let Some(&size) = ctx.local_arrays.get(&var_nm) {
+                                let local_buf_name = format!("__local_{}", size);
+                                let local_buf_id = if let Some(id) = ctx.buf_idx(&local_buf_name) {
+                                    id
+                                } else {
+                                    let id = ctx.buf_decls.len() as u32;
+                                    ctx.buf_decls.push(BufDecl {
+                                        binding: 999,
+                                        name: local_buf_name,
+                                        read_only: false,
+                                        elem_type: ScalarType::U32,
+                                    });
+                                    id
+                                };
+                                return Ok(Expr::BufSlice(local_buf_id, Box::new(range_start)));
+                            }
+                        }
+
                         return Ok(Expr::BufSlice(buf_id, Box::new(range_start)));
                     }
                 }
+            }
+
+            // Check for reference to a local array variable: &local_var
+            let inner_text = ctx.text(&inner);
+            let inner_name = inner_text.strip_prefix("mut ").unwrap_or(inner_text).trim();
+            if let Some(&size) = ctx.local_arrays.get(inner_name) {
+                // Create a synthetic local buffer and return a BufSlice
+                let local_buf_name = format!("__local_{}", size);
+                let buf_id = if let Some(id) = ctx.buf_idx(&local_buf_name) {
+                    id
+                } else {
+                    // Create the synthetic buffer on first use
+                    let id = ctx.buf_decls.len() as u32;
+                    ctx.buf_decls.push(BufDecl {
+                        binding: 999, // sentinel
+                        name: local_buf_name,
+                        read_only: false,
+                        elem_type: ScalarType::U32,
+                    });
+                    id
+                };
+                let var_idx = ctx.var_idx(inner_name);
+                return Ok(Expr::BufSlice(buf_id, Box::new(Expr::Var(var_idx))));
             }
 
             // Regular reference: just strip &
