@@ -58,13 +58,20 @@ fn buf_name(decls: &[BufDecl], idx: u32) -> String {
 
 fn fn_name(funcs: &[GpuFunction], idx: u32) -> String {
     funcs.get(idx as usize).map(|f| {
-        if f.vec_buffer_map.is_empty() {
+        let base = if f.vec_buffer_map.is_empty() {
             f.name.clone()
         } else {
             let buf_suffix: Vec<&str> = f.vec_buffer_map.iter()
                 .map(|(_, buf)| buf.as_str())
                 .collect();
             format!("{}_{}", f.name, buf_suffix.join("_"))
+        };
+        // If this function is recursive, callers should use the max-depth variant
+        let is_recursive = stmt_calls_fn(&f.body, idx);
+        if is_recursive {
+            format!("{}_d{}", base, MAX_RECURSION_DEPTH)
+        } else {
+            base
         }
     }).unwrap_or_else(|| format!("fn_{}", idx))
 }
@@ -324,22 +331,80 @@ fn emit_tuple_struct(arity: usize) -> String {
     s
 }
 
-/// Emit a helper function as WGSL.
-fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction]) -> String {
+/// Check if an expression tree contains a Call to a specific fn_id.
+fn expr_calls_fn(e: &Expr, fn_id: u32) -> bool {
+    match e {
+        Expr::Call(id, args) => {
+            if *id == fn_id { return true; }
+            args.iter().any(|a| expr_calls_fn(a, fn_id))
+        },
+        Expr::BinOp(_, a, b) => expr_calls_fn(a, fn_id) || expr_calls_fn(b, fn_id),
+        Expr::UnaryOp(_, a) => expr_calls_fn(a, fn_id),
+        Expr::Select(c, t, f) => expr_calls_fn(c, fn_id) || expr_calls_fn(t, fn_id) || expr_calls_fn(f, fn_id),
+        Expr::TupleConstruct(elems) => elems.iter().any(|e| expr_calls_fn(e, fn_id)),
+        Expr::TupleAccess(base, _) => expr_calls_fn(base, fn_id),
+        Expr::ArrayRead(_, idx) => expr_calls_fn(idx, fn_id),
+        Expr::Cast(_, inner) => expr_calls_fn(inner, fn_id),
+        Expr::VecIndex(_, idx) => expr_calls_fn(idx, fn_id),
+        Expr::ScratchRead(offset) => expr_calls_fn(offset, fn_id),
+        Expr::BufSlice(_, offset) => expr_calls_fn(offset, fn_id),
+        _ => false,
+    }
+}
+
+fn stmt_calls_fn(s: &Stmt, fn_id: u32) -> bool {
+    match s {
+        Stmt::Assign { rhs, .. } => expr_calls_fn(rhs, fn_id),
+        Stmt::TupleDestructure { rhs, .. } => expr_calls_fn(rhs, fn_id),
+        Stmt::CallStmt { fn_id: id, args, .. } => *id == fn_id || args.iter().any(|a| expr_calls_fn(a, fn_id)),
+        Stmt::Seq { first, then } => stmt_calls_fn(first, fn_id) || stmt_calls_fn(then, fn_id),
+        Stmt::If { cond, then_body, else_body } => expr_calls_fn(cond, fn_id) || stmt_calls_fn(then_body, fn_id) || stmt_calls_fn(else_body, fn_id),
+        Stmt::For { start, end, body, .. } => expr_calls_fn(start, fn_id) || expr_calls_fn(end, fn_id) || stmt_calls_fn(body, fn_id),
+        Stmt::VecPush { val, .. } => expr_calls_fn(val, fn_id),
+        Stmt::ScratchWrite { offset, val } => expr_calls_fn(offset, fn_id) || expr_calls_fn(val, fn_id),
+        _ => false,
+    }
+}
+
+const MAX_RECURSION_DEPTH: u32 = 6; // supports up to N=2^6=64 limbs
+
+/// Emit a helper function as WGSL. `fn_idx` is this function's index in all_funcs.
+fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usize) -> String {
+    // Check for self-recursion
+    let is_recursive = stmt_calls_fn(&f.body, fn_idx as u32);
+    if is_recursive {
+        return emit_recursive_unrolled(f, all_funcs, fn_idx);
+    }
+    emit_function_single(f, all_funcs, fn_idx, None)
+}
+
+/// Emit all depth-stratified copies of a recursive function.
+fn emit_recursive_unrolled(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usize) -> String {
+    let mut s = String::new();
+    // Emit depth 0 through MAX_RECURSION_DEPTH
+    for depth in 0..=MAX_RECURSION_DEPTH {
+        s.push_str(&emit_function_single(f, all_funcs, fn_idx, Some(depth)));
+    }
+    s
+}
+
+/// Emit a single function, optionally at a specific recursion depth.
+/// When depth is Some(d), self-calls are replaced:
+///   d > 0: self-call → call to _d{d-1}
+///   d == 0: self-call → call to base case (schoolbook)
+fn emit_function_single(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usize, depth: Option<u32>) -> String {
     let mut s = String::new();
 
-    // When returns_vec: the Vec part is written to an output buffer,
-    // so the return type is scalar only (strip Vec from tuple).
     let ret_ty = if f.returns_vec {
-        "u32".to_string() // just the scalar carry
+        "u32".to_string()
     } else {
         f.ret_type.as_ref()
             .map(|rt| return_type_str(rt))
             .unwrap_or_else(|| "u32".to_string())
     };
 
-    // Build monomorphized name: fn_name + buffer names for Vec params
-    let fn_display_name = if f.vec_buffer_map.is_empty() {
+    // Build name with buffer suffix and depth suffix
+    let base_name = if f.vec_buffer_map.is_empty() {
         f.name.clone()
     } else {
         let buf_suffix: Vec<&str> = f.vec_buffer_map.iter()
@@ -347,38 +412,186 @@ fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction]) -> String {
             .collect();
         format!("{}_{}", f.name, buf_suffix.join("_"))
     };
+    let fn_display_name = match depth {
+        Some(d) => format!("{}_d{}", base_name, d),
+        None => base_name.clone(),
+    };
 
-    // Signature — Vec params become offset parameters (u32)
+    // Signature
     let mut param_strs: Vec<String> = f.params.iter()
         .map(|(name, ty)| match ty {
             ParamType::Scalar(sty) => format!("{}: {}", name, scalar_type_str(sty)),
-            ParamType::VecU32 => format!("{}: u32", name), // offset into buffer
+            ParamType::VecU32 => format!("{}: u32", name),
         })
         .collect();
-    // Add output offset parameter if function returns Vec
     if f.returns_vec {
         param_strs.push("out: u32".to_string());
     }
     s.push_str(&format!("fn {}({}) -> {} {{\n", fn_display_name, param_strs.join(", "), ret_ty));
 
-    // Declare local variables (skip params and output-vec vars)
+    // Local variables
     let param_count = f.params.len();
     for i in param_count..f.var_names.len() {
         let vn = &f.var_names[i];
         if vn == "__ret" || vn == "__call_tmp" || vn == "out" { continue; }
         s.push_str(&format!("  var {}: u32;\n", vn));
     }
-
-    // Return value
     s.push_str(&format!("  var __ret: {};\n", ret_ty));
 
-    // Body — use vec_buffer_map for buffer-backed Vec params
+    // Body — emit with depth-aware call replacement
     let empty_bufs: Vec<BufDecl> = Vec::new();
-    s.push_str(&emit_stmt_ctx(&f.body, &f.var_names, &empty_bufs, all_funcs, 1, &f.vec_buffer_map));
+    let recursion_ctx = depth.map(|d| RecursionCtx {
+        self_fn_idx: fn_idx as u32,
+        current_depth: d,
+        base_name: base_name.clone(),
+    });
+    s.push_str(&emit_stmt_depth(&f.body, &f.var_names, &empty_bufs, all_funcs, 1,
+                                 &f.vec_buffer_map, &recursion_ctx));
 
     s.push_str("  return __ret;\n");
     s.push_str("}\n\n");
     s
+}
+
+/// Context for recursion unrolling.
+struct RecursionCtx {
+    self_fn_idx: u32,
+    current_depth: u32,
+    base_name: String,
+}
+
+/// Emit a statement with recursion-aware call replacement.
+fn emit_stmt_depth(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction],
+                   depth: usize, vec_buf_map: &[(String, String)], rec: &Option<RecursionCtx>) -> String {
+    let pad = "  ".repeat(depth);
+    match s {
+        Stmt::Assign { var, rhs } => {
+            let vn = var_name(var_names, *var);
+            if vn == "__ret" {
+                if let Expr::TupleConstruct(elems) = rhs {
+                    let has_output_vec = !vec_buf_map.is_empty() &&
+                        vec_buf_map.iter().any(|(name, _)| name == "out");
+                    if has_output_vec && elems.len() == 2 {
+                        return format!("{}{} = {};\n", pad, vn,
+                            emit_expr_depth(&elems[1], var_names, buf_decls, funcs, vec_buf_map, rec));
+                    }
+                }
+            }
+            format!("{}{} = {};\n", pad, vn,
+                    emit_expr_depth(rhs, var_names, buf_decls, funcs, vec_buf_map, rec))
+        },
+        Stmt::BufWrite { buf, idx, val } =>
+            format!("{}{}[{}] = {};\n", pad, buf_name(buf_decls, *buf),
+                    emit_expr_depth(idx, var_names, buf_decls, funcs, vec_buf_map, rec),
+                    emit_expr_depth(val, var_names, buf_decls, funcs, vec_buf_map, rec)),
+        Stmt::CallStmt { fn_id, args, result_var } => {
+            let name = resolve_fn_name(funcs, *fn_id, rec);
+            let arg_strs: Vec<String> = args.iter()
+                .map(|a| emit_expr_depth(a, var_names, buf_decls, funcs, vec_buf_map, rec))
+                .collect();
+            format!("{}{} = {}({});\n", pad, var_name(var_names, *result_var),
+                    name, arg_strs.join(", "))
+        },
+        Stmt::TupleDestructure { vars, rhs } => {
+            let mut s = format!("{}{{\n", pad);
+            s.push_str(&format!("{}  var __td = {};\n", pad,
+                emit_expr_depth(rhs, var_names, buf_decls, funcs, vec_buf_map, rec)));
+            for (i, var) in vars.iter().enumerate() {
+                s.push_str(&format!("{}  {} = __td._{};\n", pad, var_name(var_names, *var), i));
+            }
+            s.push_str(&format!("{}}}\n", pad));
+            s
+        },
+        Stmt::Seq { first, then } => {
+            let mut s = emit_stmt_depth(first, var_names, buf_decls, funcs, depth, vec_buf_map, rec);
+            s.push_str(&emit_stmt_depth(then, var_names, buf_decls, funcs, depth, vec_buf_map, rec));
+            s
+        },
+        Stmt::If { cond, then_body, else_body } => {
+            let mut s = format!("{}if ({}) {{\n", pad,
+                emit_expr_depth(cond, var_names, buf_decls, funcs, vec_buf_map, rec));
+            s.push_str(&emit_stmt_depth(then_body, var_names, buf_decls, funcs, depth + 1, vec_buf_map, rec));
+            s.push_str(&format!("{}}} else {{\n", pad));
+            s.push_str(&emit_stmt_depth(else_body, var_names, buf_decls, funcs, depth + 1, vec_buf_map, rec));
+            s.push_str(&format!("{}}}\n", pad));
+            s
+        },
+        Stmt::For { var, start, end, body } => {
+            let vn = var_name(var_names, *var);
+            let mut s = format!("{}for (var {}: u32 = {}; {} < {}; {}++) {{\n",
+                pad, vn, emit_expr_depth(start, var_names, buf_decls, funcs, vec_buf_map, rec),
+                vn, emit_expr_depth(end, var_names, buf_decls, funcs, vec_buf_map, rec), vn);
+            s.push_str(&emit_stmt_depth(body, var_names, buf_decls, funcs, depth + 1, vec_buf_map, rec));
+            s.push_str(&format!("{}}}\n", pad));
+            s
+        },
+        Stmt::VecPush { vec_var, val } => {
+            let vn = var_name(var_names, *vec_var);
+            let buf = vec_buf_map.iter()
+                .find(|(param, _)| param == &vn)
+                .map(|(_, b)| b.as_str())
+                .unwrap_or("scratch");
+            let len_var = format!("{}_len", vn);
+            format!("{}{}[({} + {})] = {};\n{}{} = {} + 1u;\n",
+                    pad, buf, vn, len_var,
+                    emit_expr_depth(val, var_names, buf_decls, funcs, vec_buf_map, rec),
+                    pad, len_var, len_var)
+        },
+        Stmt::ScratchWrite { offset, val } =>
+            format!("{}scratch[{}] = {};\n", pad,
+                    emit_expr_depth(offset, var_names, buf_decls, funcs, vec_buf_map, rec),
+                    emit_expr_depth(val, var_names, buf_decls, funcs, vec_buf_map, rec)),
+        Stmt::Break => format!("{}break;\n", pad),
+        Stmt::Continue => format!("{}continue;\n", pad),
+        Stmt::Barrier { scope } => {
+            let name = match scope {
+                BarrierScope::Workgroup => "workgroupBarrier()",
+                BarrierScope::Storage => "storageBarrier()",
+                BarrierScope::Subgroup => "subgroupBarrier()",
+            };
+            format!("{}{};\n", pad, name)
+        },
+        Stmt::Return => format!("{}return;\n", pad),
+        Stmt::Noop => String::new(),
+    }
+}
+
+/// Emit an expression with recursion-aware call replacement.
+fn emit_expr_depth(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction],
+                   vec_buf_map: &[(String, String)], rec: &Option<RecursionCtx>) -> String {
+    match e {
+        Expr::Call(fn_id, args) => {
+            let name = resolve_fn_name(funcs, *fn_id, rec);
+            let arg_strs: Vec<String> = args.iter()
+                .map(|a| emit_expr_depth(a, var_names, buf_decls, funcs, vec_buf_map, rec))
+                .collect();
+            format!("{}({})", name, arg_strs.join(", "))
+        },
+        // For all other expressions, delegate to emit_expr_ctx
+        _ => emit_expr_ctx(e, var_names, buf_decls, funcs, vec_buf_map),
+    }
+}
+
+/// Resolve function name, handling recursion depth replacement.
+fn resolve_fn_name(funcs: &[GpuFunction], fn_id: u32, rec: &Option<RecursionCtx>) -> String {
+    if let Some(ctx) = rec {
+        if fn_id == ctx.self_fn_idx {
+            if ctx.current_depth == 0 {
+                // At depth 0: replace self-calls with schoolbook (the non-recursive base case).
+                // Find schoolbook in the functions list by name.
+                for (i, f) in funcs.iter().enumerate() {
+                    if f.name.contains("schoolbook") {
+                        return fn_name(funcs, i as u32);
+                    }
+                }
+                // Fallback: use _d0 (will hit if-branch base case)
+                return format!("{}_d0", ctx.base_name);
+            } else {
+                return format!("{}_d{}", ctx.base_name, ctx.current_depth - 1);
+            }
+        }
+    }
+    fn_name(funcs, fn_id)
 }
 
 pub fn emit_kernel(k: &Kernel) -> String {
@@ -404,8 +617,8 @@ pub fn emit_kernel(k: &Kernel) -> String {
     s.push('\n');
 
     // Helper functions
-    for f in &k.functions {
-        s.push_str(&emit_function(f, &k.functions));
+    for (i, f) in k.functions.iter().enumerate() {
+        s.push_str(&emit_function(f, &k.functions, i));
     }
 
     // Entry point
