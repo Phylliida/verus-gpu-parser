@@ -1,5 +1,5 @@
-/// Test kernel: call generic_add_limbs with buffer slice arguments.
-/// The transpiler should monomorphize based on which buffers are passed.
+/// Test kernel that calls verified generic_add_limbs from verus-fixed-point.
+/// The transpiler follows `use` imports and transpiles the function directly.
 
 use verus_fixed_point::fixed_point::limb_ops::*;
 
@@ -13,12 +13,8 @@ fn test_add_buffers(
     let n = 4u32;
     let base = tid * n;
 
-    // Call generic_add_limbs with buffer slices.
-    // The transpiler sees &a_buf[base..] and &b_buf[base..] as BufSlice args,
-    // and monomorphizes generic_add_limbs for these specific buffers.
     let (result, carry) = generic_add_limbs(&a_buf[base..], &b_buf[base..], n);
 
-    // Write result to output buffer
     for i in 0u32..n {
         out_buf[base + i] = result[i];
     }

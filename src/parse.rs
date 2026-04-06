@@ -1211,9 +1211,10 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
                         Ok(Expr::BinOp(BinOp::WrappingMul, Box::new(receiver_expr), Box::new(rhs)))
                     },
                     _ => {
-                        // Unknown method — treat as function call
-                        let fn_id = ctx.fn_id(&func_text);
-                        ctx.called_fns.insert(func_text);
+                        // Unknown method — treat as function call with receiver as first arg
+                        let method_str = method_name.to_string();
+                        let fn_id = ctx.fn_id(&method_str);
+                        ctx.called_fns.insert(method_str);
                         let mut all_args = vec![receiver_expr];
                         all_args.extend(args);
                         Ok(Expr::Call(fn_id, all_args))
@@ -1221,8 +1222,8 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
                 };
             }
 
-            // Regular function call
-            let func_name = func_text;
+            // Regular function call — strip type prefixes like T:: or Self::
+            let func_name = func_text.split("::").last().unwrap_or(&func_text).to_string();
             let args = parse_call_args(node, ctx)?;
             let fn_id = ctx.fn_id(&func_name);
             ctx.called_fns.insert(func_name);
