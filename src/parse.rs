@@ -236,30 +236,9 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         Stmt::Noop
     };
 
-    // Phase 7: Populate vec_buffer_map from call sites with BufSlice arguments.
-    // Walk the kernel body to find calls like generic_add_limbs(&a_buf[base..], &b_buf[base..], n)
-    // and map each Vec param to the buffer name it's called with.
-    populate_vec_buffer_maps(&final_body, &final_ctx.buf_decls, &mut functions);
-
-    // Phase 8: Propagate vec_buffer_map through the call chain.
-    propagate_buffer_maps(&mut functions);
-
-    // Phase 9: Any function with Vec::new() in its body needs returns_vec = true
-    // and an "out" buffer mapping. Default to the first buffer in its vec_buffer_map.
-    for f in &mut functions {
-        // Check if function creates a Vec::new() (has vec_var "out" or "out_len" in var_names)
-        let has_vec_new = f.var_names.iter().any(|v| v == "out_len");
-        if has_vec_new && !f.returns_vec {
-            f.returns_vec = true;
-            // Default output buffer = same as first input buffer, or "scratch"
-            let default_buf = f.vec_buffer_map.first()
-                .map(|(_, b)| b.clone())
-                .unwrap_or_else(|| "scratch".to_string());
-            if !f.vec_buffer_map.iter().any(|(p, _)| p == "out") {
-                f.vec_buffer_map.push(("out".to_string(), default_buf));
-            }
-        }
-    }
+    // Phase 7-9: Collect ALL unique buffer mappings per function from call sites,
+    // propagate through call chain, and duplicate functions for each unique mapping.
+    monomorphize_all(&final_body, &final_ctx.buf_decls, &mut functions);
 
     let fn_name_to_id_vec: Vec<(String, u32)> = fn_id_map.into_iter().collect();
 
@@ -274,6 +253,211 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         fn_name_to_id: fn_name_to_id_vec,
         scratch_size: 0,
     })
+}
+
+/// Monomorphize all Vec-param functions: for each unique buffer combination
+/// at call sites, create a separate copy of the function with that mapping.
+fn monomorphize_all(kernel_body: &Stmt, buf_decls: &[BufDecl], functions: &mut Vec<GpuFunction>) {
+    // Step 1: Collect all (fn_idx, buffer_mapping) pairs from call sites.
+    // Start from kernel body, then propagate through the call chain.
+    let mut all_mappings: HashMap<usize, Vec<Vec<(String, String)>>> = HashMap::new();
+
+    // Scan kernel body for BufSlice args
+    collect_call_mappings(kernel_body, buf_decls, functions, &mut all_mappings);
+
+    // Step 2: Propagate — for each function with a mapping, scan ITS body
+    // to find calls to other functions and resolve their mappings.
+    let mut queue: Vec<(usize, Vec<(String, String)>)> = Vec::new();
+    for (fn_idx, mappings) in &all_mappings {
+        for m in mappings {
+            queue.push((*fn_idx, m.clone()));
+        }
+    }
+
+    let mut visited: HashSet<(usize, String)> = HashSet::new(); // (fn_idx, mapping_key)
+    while let Some((fn_idx, mapping)) = queue.pop() {
+        let key = format!("{}:{}", fn_idx, mapping.iter().map(|(p,b)| format!("{}={}", p, b)).collect::<Vec<_>>().join(","));
+        if visited.contains(&(fn_idx, key.clone())) { continue; }
+        visited.insert((fn_idx, key));
+
+        // Build this function's param→buffer lookup
+        let caller_lookup: HashMap<String, String> = mapping.iter().cloned().collect();
+
+        // Scan body for calls
+        let calls = collect_calls_from_stmt(&functions[fn_idx].body);
+        for (callee_fn_id, arg_exprs) in &calls {
+            let callee_idx = *callee_fn_id as usize;
+            if callee_idx >= functions.len() { continue; }
+
+            let callee_vec_params: Vec<String> = functions[callee_idx].params.iter()
+                .filter(|(_, ty)| matches!(ty, ParamType::VecU32))
+                .map(|(name, _)| name.clone())
+                .collect();
+
+            if callee_vec_params.is_empty() { continue; }
+
+            // Match args to callee Vec params
+            let mut callee_mapping: Vec<(String, String)> = Vec::new();
+            let mut vec_pi = 0;
+            for arg in arg_exprs {
+                if let Expr::Var(var_id) = arg {
+                    let var_name_str = functions[fn_idx].var_names
+                        .get(*var_id as usize).cloned().unwrap_or_default();
+                    if let Some(buf) = caller_lookup.get(&var_name_str) {
+                        if vec_pi < callee_vec_params.len() {
+                            callee_mapping.push((callee_vec_params[vec_pi].clone(), buf.clone()));
+                            vec_pi += 1;
+                        } else {
+                            // Extra = output
+                            callee_mapping.push(("out".to_string(), buf.clone()));
+                        }
+                    }
+                } else if let Expr::BufSlice(buf_id, _) = arg {
+                    let buf_name = buf_decls.get(*buf_id as usize)
+                        .map(|b| b.name.clone()).unwrap_or_else(|| format!("buf_{}", buf_id));
+                    if vec_pi < callee_vec_params.len() {
+                        callee_mapping.push((callee_vec_params[vec_pi].clone(), buf_name));
+                        vec_pi += 1;
+                    } else {
+                        callee_mapping.push(("out".to_string(), buf_name));
+                    }
+                }
+            }
+
+            if !callee_mapping.is_empty() {
+                all_mappings.entry(callee_idx).or_default().push(callee_mapping.clone());
+                queue.push((callee_idx, callee_mapping));
+            }
+        }
+
+        // Also propagate to base_case
+        if let Some(ref base_name) = functions[fn_idx].base_case {
+            for bi in 0..functions.len() {
+                if &functions[bi].name == base_name {
+                    all_mappings.entry(bi).or_default().push(mapping.clone());
+                    queue.push((bi, mapping.clone()));
+                }
+            }
+        }
+    }
+
+    // Step 3: Deduplicate mappings per function
+    for (_, mappings) in all_mappings.iter_mut() {
+        mappings.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+        mappings.dedup_by(|a, b| format!("{:?}", a) == format!("{:?}", b));
+    }
+
+    // Step 4: For functions with multiple mappings, duplicate them.
+    // For functions with one mapping, just set it.
+    let orig_len = functions.len();
+    let mut fn_id_remap: HashMap<(usize, String), usize> = HashMap::new(); // (orig_idx, mapping_key) → new_idx
+
+    for fn_idx in 0..orig_len {
+        if let Some(mappings) = all_mappings.get(&fn_idx) {
+            if mappings.len() == 1 {
+                functions[fn_idx].vec_buffer_map = mappings[0].clone();
+                functions[fn_idx].returns_vec = !functions[fn_idx].params.iter().any(|(n, _)| n == "out") && mappings[0].iter().any(|(p, _)| p == "out");
+                let key = format!("{:?}", mappings[0]);
+                fn_id_remap.insert((fn_idx, key), fn_idx);
+            } else {
+                // First mapping stays on original
+                functions[fn_idx].vec_buffer_map = mappings[0].clone();
+                functions[fn_idx].returns_vec = !functions[fn_idx].params.iter().any(|(n, _)| n == "out") && mappings[0].iter().any(|(p, _)| p == "out");
+                let key0 = format!("{:?}", mappings[0]);
+                fn_id_remap.insert((fn_idx, key0), fn_idx);
+
+                // Additional mappings: clone the function
+                for mi in 1..mappings.len() {
+                    let mut clone = functions[fn_idx].clone();
+                    clone.vec_buffer_map = mappings[mi].clone();
+                    clone.returns_vec = !functions[fn_idx].params.iter().any(|(n, _)| n == "out") && mappings[mi].iter().any(|(p, _)| p == "out");
+                    let new_idx = functions.len();
+                    let key = format!("{:?}", mappings[mi]);
+                    fn_id_remap.insert((fn_idx, key), new_idx);
+                    functions.push(clone);
+                }
+            }
+        }
+    }
+
+    // Step 5: Mark functions with Vec::new() as returns_vec
+    // BUT only if "out" isn't already a named Vec parameter
+    for f in functions.iter_mut() {
+        let has_vec_new = f.var_names.iter().any(|v| v == "out_len");
+        let has_out_param = f.params.iter().any(|(name, _)| name == "out");
+        if has_vec_new && !f.returns_vec && !has_out_param {
+            f.returns_vec = true;
+            let default_buf = f.vec_buffer_map.first()
+                .map(|(_, b)| b.clone()).unwrap_or_else(|| "scratch".to_string());
+            if !f.vec_buffer_map.iter().any(|(p, _)| p == "out") {
+                f.vec_buffer_map.push(("out".to_string(), default_buf));
+            }
+        }
+    }
+}
+
+/// Collect (fn_idx, buffer_mapping) from BufSlice call arguments in a statement.
+fn collect_call_mappings(
+    body: &Stmt, buf_decls: &[BufDecl], functions: &[GpuFunction],
+    result: &mut HashMap<usize, Vec<Vec<(String, String)>>>,
+) {
+    match body {
+        Stmt::Assign { rhs, .. } | Stmt::TupleDestructure { rhs, .. } => {
+            scan_expr_for_mappings(rhs, buf_decls, functions, result);
+        },
+        Stmt::CallStmt { fn_id, args, .. } => {
+            let call_expr = Expr::Call(*fn_id, args.clone());
+            scan_expr_for_mappings(&call_expr, buf_decls, functions, result);
+        },
+        Stmt::Seq { first, then } => {
+            collect_call_mappings(first, buf_decls, functions, result);
+            collect_call_mappings(then, buf_decls, functions, result);
+        },
+        Stmt::If { then_body, else_body, .. } => {
+            collect_call_mappings(then_body, buf_decls, functions, result);
+            collect_call_mappings(else_body, buf_decls, functions, result);
+        },
+        Stmt::For { body, .. } => collect_call_mappings(body, buf_decls, functions, result),
+        _ => {},
+    }
+}
+
+fn scan_expr_for_mappings(
+    expr: &Expr, buf_decls: &[BufDecl], functions: &[GpuFunction],
+    result: &mut HashMap<usize, Vec<Vec<(String, String)>>>,
+) {
+    if let Expr::Call(fn_id, args) = expr {
+        let fn_idx = *fn_id as usize;
+        if fn_idx < functions.len() {
+            let vec_params: Vec<String> = functions[fn_idx].params.iter()
+                .filter(|(_, ty)| matches!(ty, ParamType::VecU32))
+                .map(|(name, _)| name.clone())
+                .collect();
+
+            if !vec_params.is_empty() {
+                let buf_slices: Vec<(u32, &Expr)> = args.iter()
+                    .filter_map(|a| if let Expr::BufSlice(buf_id, offset) = a {
+                        Some((*buf_id, offset.as_ref()))
+                    } else { None })
+                    .collect();
+
+                if !buf_slices.is_empty() {
+                    let mut mapping: Vec<(String, String)> = Vec::new();
+                    for (i, (buf_id, _)) in buf_slices.iter().enumerate() {
+                        let buf_name = buf_decls.get(*buf_id as usize)
+                            .map(|b| b.name.clone()).unwrap_or_else(|| format!("buf_{}", buf_id));
+                        if i < vec_params.len() {
+                            mapping.push((vec_params[i].clone(), buf_name));
+                        } else {
+                            mapping.push(("out".to_string(), buf_name));
+                        }
+                    }
+                    result.entry(fn_idx).or_default().push(mapping);
+                }
+            }
+        }
+        for a in args { scan_expr_for_mappings(a, buf_decls, functions, result); }
+    }
 }
 
 /// Propagate buffer mappings through the call chain until fixed point.
