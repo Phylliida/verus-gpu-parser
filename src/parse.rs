@@ -240,6 +240,25 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
     // propagate through call chain, and duplicate functions for each unique mapping.
     monomorphize_all(&final_body, &final_ctx.buf_decls, &mut functions);
 
+    // Phase 10: Rewrite Call expressions to point to the correct monomorphized variant.
+    // Each call site's buffer args determine which variant to use.
+    let final_body = rewrite_calls_for_monomorphization(
+        final_body, &final_ctx.buf_decls, &functions, &final_ctx.var_names);
+    // Also rewrite calls inside each function body.
+    // Each function uses its own vec_buffer_map to resolve var → buffer.
+    for i in 0..functions.len() {
+        let body = functions[i].body.clone();
+        let fn_var_names = functions[i].var_names.clone();
+        // Build caller_bufs from this function's vec_buffer_map
+        let mut fn_bufs: HashMap<String, String> = HashMap::new();
+        for (param_name, buf_name) in &functions[i].vec_buffer_map {
+            fn_bufs.insert(param_name.clone(), buf_name.clone());
+        }
+        let rewritten = rewrite_calls_with_bufs(
+            body, &final_ctx.buf_decls, &functions, &fn_var_names, &fn_bufs);
+        functions[i].body = rewritten;
+    }
+
     let fn_name_to_id_vec: Vec<(String, u32)> = fn_id_map.into_iter().collect();
 
     Ok(Kernel {
@@ -554,6 +573,189 @@ fn propagate_buffer_maps(functions: &mut Vec<GpuFunction>) {
 
         if !changed { break; }
     }
+}
+
+/// Rewrite calls using a specific caller buffer map.
+fn rewrite_calls_with_bufs(
+    body: Stmt, buf_decls: &[BufDecl], functions: &[GpuFunction],
+    var_names: &[String], caller_bufs: &HashMap<String, String>,
+) -> Stmt {
+    let mut variants: HashMap<String, Vec<(Vec<(String, String)>, usize)>> = HashMap::new();
+    for (idx, f) in functions.iter().enumerate() {
+        if !f.vec_buffer_map.is_empty() || f.vec_params.len() > 0 {
+            variants.entry(f.name.clone()).or_default().push((f.vec_buffer_map.clone(), idx));
+        }
+    }
+    rewrite_stmt(body, buf_decls, functions, &variants, var_names, caller_bufs)
+}
+
+/// Rewrite Call fn_ids to point to the correct monomorphized variant.
+/// For each Call, determine which buffers back the Vec args, then find the variant
+/// with matching vec_buffer_map.
+fn rewrite_calls_for_monomorphization(
+    body: Stmt, buf_decls: &[BufDecl], functions: &[GpuFunction], caller_var_names: &[String],
+) -> Stmt {
+    // Build lookup: for each function that has Vec params, build a map from
+    // buffer_combination_key → fn_idx for all variants of that function name
+    let mut variants: HashMap<String, Vec<(Vec<(String, String)>, usize)>> = HashMap::new();
+    for (idx, f) in functions.iter().enumerate() {
+        if !f.vec_buffer_map.is_empty() || f.vec_params.len() > 0 {
+            variants.entry(f.name.clone()).or_default().push((f.vec_buffer_map.clone(), idx));
+        }
+    }
+
+    // Build caller's var_name → buffer_name lookup from caller's function context
+    // (for the kernel, this comes from buf_decls; for functions, from vec_buffer_map)
+    let mut caller_buf_lookup: HashMap<String, String> = HashMap::new();
+    for decl in buf_decls {
+        caller_buf_lookup.insert(decl.name.clone(), decl.name.clone());
+    }
+
+    rewrite_stmt(body, buf_decls, functions, &variants, caller_var_names, &caller_buf_lookup)
+}
+
+fn rewrite_stmt(
+    s: Stmt, buf_decls: &[BufDecl], functions: &[GpuFunction],
+    variants: &HashMap<String, Vec<(Vec<(String, String)>, usize)>>,
+    var_names: &[String], caller_bufs: &HashMap<String, String>,
+) -> Stmt {
+    match s {
+        Stmt::Assign { var, rhs } =>
+            Stmt::Assign { var, rhs: rewrite_expr(rhs, buf_decls, functions, variants, var_names, caller_bufs) },
+        Stmt::TupleDestructure { vars, rhs } =>
+            Stmt::TupleDestructure { vars, rhs: rewrite_expr(rhs, buf_decls, functions, variants, var_names, caller_bufs) },
+        Stmt::CallStmt { fn_id, args, result_var } => {
+            let new_args: Vec<Expr> = args.into_iter()
+                .map(|a| rewrite_expr(a, buf_decls, functions, variants, var_names, caller_bufs))
+                .collect();
+            let new_id = resolve_call_variant(fn_id, &new_args, buf_decls, functions, variants, var_names, caller_bufs);
+            Stmt::CallStmt { fn_id: new_id, args: new_args, result_var }
+        },
+        Stmt::Seq { first, then } => Stmt::Seq {
+            first: Box::new(rewrite_stmt(*first, buf_decls, functions, variants, var_names, caller_bufs)),
+            then: Box::new(rewrite_stmt(*then, buf_decls, functions, variants, var_names, caller_bufs)),
+        },
+        Stmt::If { cond, then_body, else_body } => Stmt::If {
+            cond: rewrite_expr(cond, buf_decls, functions, variants, var_names, caller_bufs),
+            then_body: Box::new(rewrite_stmt(*then_body, buf_decls, functions, variants, var_names, caller_bufs)),
+            else_body: Box::new(rewrite_stmt(*else_body, buf_decls, functions, variants, var_names, caller_bufs)),
+        },
+        Stmt::For { var, start, end, body } => Stmt::For {
+            var,
+            start: rewrite_expr(start, buf_decls, functions, variants, var_names, caller_bufs),
+            end: rewrite_expr(end, buf_decls, functions, variants, var_names, caller_bufs),
+            body: Box::new(rewrite_stmt(*body, buf_decls, functions, variants, var_names, caller_bufs)),
+        },
+        Stmt::ScratchWrite { offset, val } => Stmt::ScratchWrite {
+            offset: rewrite_expr(offset, buf_decls, functions, variants, var_names, caller_bufs),
+            val: rewrite_expr(val, buf_decls, functions, variants, var_names, caller_bufs),
+        },
+        Stmt::VecPush { vec_var, val } => Stmt::VecPush {
+            vec_var, val: rewrite_expr(val, buf_decls, functions, variants, var_names, caller_bufs),
+        },
+        other => other,
+    }
+}
+
+fn rewrite_expr(
+    e: Expr, buf_decls: &[BufDecl], functions: &[GpuFunction],
+    variants: &HashMap<String, Vec<(Vec<(String, String)>, usize)>>,
+    var_names: &[String], caller_bufs: &HashMap<String, String>,
+) -> Expr {
+    match e {
+        Expr::Call(fn_id, args) => {
+            let new_args: Vec<Expr> = args.into_iter()
+                .map(|a| rewrite_expr(a, buf_decls, functions, variants, var_names, caller_bufs))
+                .collect();
+            let new_id = resolve_call_variant(fn_id, &new_args, buf_decls, functions, variants, var_names, caller_bufs);
+            Expr::Call(new_id, new_args)
+        },
+        Expr::BinOp(op, a, b) => Expr::BinOp(op,
+            Box::new(rewrite_expr(*a, buf_decls, functions, variants, var_names, caller_bufs)),
+            Box::new(rewrite_expr(*b, buf_decls, functions, variants, var_names, caller_bufs))),
+        Expr::UnaryOp(op, a) => Expr::UnaryOp(op,
+            Box::new(rewrite_expr(*a, buf_decls, functions, variants, var_names, caller_bufs))),
+        Expr::TupleConstruct(elems) => Expr::TupleConstruct(
+            elems.into_iter().map(|e| rewrite_expr(e, buf_decls, functions, variants, var_names, caller_bufs)).collect()),
+        Expr::TupleAccess(base, idx) => Expr::TupleAccess(
+            Box::new(rewrite_expr(*base, buf_decls, functions, variants, var_names, caller_bufs)), idx),
+        Expr::Select(c, t, f) => Expr::Select(
+            Box::new(rewrite_expr(*c, buf_decls, functions, variants, var_names, caller_bufs)),
+            Box::new(rewrite_expr(*t, buf_decls, functions, variants, var_names, caller_bufs)),
+            Box::new(rewrite_expr(*f, buf_decls, functions, variants, var_names, caller_bufs))),
+        other => other,
+    }
+}
+
+/// Given a Call's fn_id and args, find the monomorphized variant whose
+/// vec_buffer_map matches the buffers used at this call site.
+fn resolve_call_variant(
+    fn_id: u32, args: &[Expr], buf_decls: &[BufDecl], functions: &[GpuFunction],
+    variants: &HashMap<String, Vec<(Vec<(String, String)>, usize)>>,
+    var_names: &[String], caller_bufs: &HashMap<String, String>,
+) -> u32 {
+    let fn_idx = fn_id as usize;
+    if fn_idx >= functions.len() { return fn_id; }
+    let fn_name = &functions[fn_idx].name;
+
+    let fn_variants = match variants.get(fn_name) {
+        Some(v) if v.len() > 1 => v,
+        _ => return fn_id, // only one variant or no Vec params
+    };
+
+    // Determine buffer combination from args
+    let callee_vec_params: Vec<&str> = functions[fn_idx].params.iter()
+        .filter(|(_, ty)| matches!(ty, ParamType::VecU32))
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    if callee_vec_params.is_empty() { return fn_id; }
+
+    let mut call_mapping: Vec<(String, String)> = Vec::new();
+    let mut vec_pi = 0;
+
+    for arg in args {
+        match arg {
+            Expr::BufSlice(buf_id, _) => {
+                let buf_name = buf_decls.get(*buf_id as usize)
+                    .map(|b| b.name.clone()).unwrap_or_else(|| format!("buf_{}", buf_id));
+                if vec_pi < callee_vec_params.len() {
+                    call_mapping.push((callee_vec_params[vec_pi].to_string(), buf_name));
+                    vec_pi += 1;
+                } else {
+                    call_mapping.push(("out".to_string(), buf_name));
+                }
+            },
+            Expr::Var(var_id) => {
+                let vn = var_names.get(*var_id as usize).cloned().unwrap_or_default();
+                if let Some(buf) = caller_bufs.get(&vn) {
+                    if vec_pi < callee_vec_params.len() {
+                        call_mapping.push((callee_vec_params[vec_pi].to_string(), buf.clone()));
+                        vec_pi += 1;
+                    } else {
+                        call_mapping.push(("out".to_string(), buf.clone()));
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+
+    if call_mapping.is_empty() { return fn_id; }
+
+    // Find variant with matching buffer map
+    for (variant_map, variant_idx) in fn_variants {
+        if maps_match(&call_mapping, variant_map) {
+            return *variant_idx as u32;
+        }
+    }
+
+    fn_id // no match found, keep original
+}
+
+fn maps_match(a: &[(String, String)], b: &[(String, String)]) -> bool {
+    if a.len() != b.len() { return false; }
+    a.iter().zip(b.iter()).all(|((ap, ab), (bp, bb))| ap == bp && ab == bb)
 }
 
 /// Collect all (fn_id, args) from Call expressions in a statement.
