@@ -573,18 +573,13 @@ fn emit_expr_depth(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs:
 }
 
 /// Resolve function name, handling recursion depth replacement.
+/// General: at depth K>0, self-calls become _d{K-1}.
+/// At depth 0, self-calls stay as _d0 — the base case in the
+/// function body prevents actual recursion for small enough inputs.
 fn resolve_fn_name(funcs: &[GpuFunction], fn_id: u32, rec: &Option<RecursionCtx>) -> String {
     if let Some(ctx) = rec {
         if fn_id == ctx.self_fn_idx {
             if ctx.current_depth == 0 {
-                // At depth 0: replace self-calls with schoolbook (the non-recursive base case).
-                // Find schoolbook in the functions list by name.
-                for (i, f) in funcs.iter().enumerate() {
-                    if f.name.contains("schoolbook") {
-                        return fn_name(funcs, i as u32);
-                    }
-                }
-                // Fallback: use _d0 (will hit if-branch base case)
                 return format!("{}_d0", ctx.base_name);
             } else {
                 return format!("{}_d{}", ctx.base_name, ctx.current_depth - 1);
