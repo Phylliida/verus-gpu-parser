@@ -438,16 +438,10 @@ fn parse_helper_function(
         .unwrap_or_else(|| "f".to_string());
 
     // Check for #[gpu_base_case(name)] attribute.
-    // Search in both the node text AND the source text preceding the function
-    // (the attribute may be a preceding sibling not included in the function_item node).
-    let fn_text = fn_node.utf8_text(source.as_bytes()).unwrap_or("");
-    let fn_start = fn_node.start_byte();
-    // Look at up to 200 bytes before the function start for preceding attributes
-    let prefix_start = if fn_start > 200 { fn_start - 200 } else { 0 };
-    let search_text = &source[prefix_start..fn_start.min(source.len())];
-    let combined = format!("{}\n{}", search_text, fn_text);
-    let base_case = if let Some(start) = combined.find("gpu_base_case(") {
-        let rest = &combined[start + "gpu_base_case(".len()..];
+    // imports.rs prepends preceding attribute_item nodes to the source text,
+    // so searching `source` finds attributes that were siblings in the original file.
+    let base_case = if let Some(start) = source.find("gpu_base_case(") {
+        let rest = &source[start + "gpu_base_case(".len()..];
         rest.find(')').map(|end| rest[..end].trim().to_string())
     } else { None };
 
