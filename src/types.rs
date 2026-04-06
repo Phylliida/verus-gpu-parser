@@ -32,12 +32,14 @@ pub enum Expr {
     Select(Box<Expr>, Box<Expr>, Box<Expr>),
     ArrayRead(u32, Box<Expr>),
     Cast(ScalarType, Box<Expr>),
+    Call(u32, Vec<Expr>),           // fn_id, args → returns value
 }
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Assign { var: u32, rhs: Expr },
     BufWrite { buf: u32, idx: Expr, val: Expr },
+    CallStmt { fn_id: u32, args: Vec<Expr>, result_var: u32 },
     Seq { first: Box<Stmt>, then: Box<Stmt> },
     If { cond: Expr, then_body: Box<Stmt>, else_body: Box<Stmt> },
     For { var: u32, start: Expr, end: Expr, body: Box<Stmt> },
@@ -69,6 +71,17 @@ pub struct BufDecl {
     pub elem_type: ScalarType,
 }
 
+/// A helper function callable from the kernel or other helpers.
+#[derive(Debug, Clone)]
+pub struct GpuFunction {
+    pub name: String,
+    pub params: Vec<(String, ScalarType)>,  // (name, type)
+    pub ret_type: Option<ScalarType>,
+    pub var_names: Vec<String>,
+    pub body: Stmt,
+    pub ret_var: u32,                       // local holding return value
+}
+
 #[derive(Debug, Clone)]
 pub struct Kernel {
     pub name: String,
@@ -77,4 +90,6 @@ pub struct Kernel {
     pub body: Stmt,
     pub workgroup_size: (u32, u32, u32),
     pub builtin_names: Vec<String>,
+    pub functions: Vec<GpuFunction>,        // helper functions (reachable from kernel)
+    pub fn_name_to_id: Vec<(String, u32)>,  // name → index into functions
 }

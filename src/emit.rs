@@ -1,5 +1,6 @@
 ///  WGSL emitter — plain Rust version mirroring the verified emitter.
 ///  Structural correspondence with wgsl_emit.rs ensures correctness.
+///  Now supports helper function emission and function calls.
 
 use crate::types::*;
 
@@ -41,7 +42,11 @@ fn buf_name(decls: &[BufDecl], idx: u32) -> String {
     decls.get(idx as usize).map(|d| d.name.clone()).unwrap_or_else(|| format!("buf_{}", idx))
 }
 
-pub fn emit_expr(e: &Expr, var_names: &[String], buf_decls: &[BufDecl]) -> String {
+fn fn_name(funcs: &[GpuFunction], idx: u32) -> String {
+    funcs.get(idx as usize).map(|f| f.name.clone()).unwrap_or_else(|| format!("fn_{}", idx))
+}
+
+pub fn emit_expr(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction]) -> String {
     match e {
         Expr::Const(val, ty) => match ty {
             ScalarType::F32 | ScalarType::F16 => format!("{}.0f", val),
@@ -52,50 +57,66 @@ pub fn emit_expr(e: &Expr, var_names: &[String], buf_decls: &[BufDecl]) -> Strin
         Expr::Var(idx) => var_name(var_names, *idx),
         Expr::Builtin(idx) => var_name(var_names, *idx),
         Expr::BinOp(op, a, b) =>
-            format!("({} {} {})", emit_expr(a, var_names, buf_decls),
-                    binop_str(op), emit_expr(b, var_names, buf_decls)),
+            format!("({} {} {})", emit_expr(a, var_names, buf_decls, funcs),
+                    binop_str(op), emit_expr(b, var_names, buf_decls, funcs)),
         Expr::UnaryOp(op, a) =>
-            format!("({}{})", unaryop_str(op), emit_expr(a, var_names, buf_decls)),
+            format!("({}{})", unaryop_str(op), emit_expr(a, var_names, buf_decls, funcs)),
         Expr::Select(c, t, f) =>
             format!("select({}, {}, {})",
-                    emit_expr(f, var_names, buf_decls),
-                    emit_expr(t, var_names, buf_decls),
-                    emit_expr(c, var_names, buf_decls)),
+                    emit_expr(f, var_names, buf_decls, funcs),
+                    emit_expr(t, var_names, buf_decls, funcs),
+                    emit_expr(c, var_names, buf_decls, funcs)),
         Expr::ArrayRead(buf, idx) =>
-            format!("{}[{}]", buf_name(buf_decls, *buf), emit_expr(idx, var_names, buf_decls)),
+            format!("{}[{}]", buf_name(buf_decls, *buf), emit_expr(idx, var_names, buf_decls, funcs)),
         Expr::Cast(ty, inner) =>
-            format!("{}({})", scalar_type_str(ty), emit_expr(inner, var_names, buf_decls)),
+            format!("{}({})", scalar_type_str(ty), emit_expr(inner, var_names, buf_decls, funcs)),
+        Expr::Call(fn_id, args) => {
+            let name = fn_name(funcs, *fn_id);
+            let arg_strs: Vec<String> = args.iter()
+                .map(|a| emit_expr(a, var_names, buf_decls, funcs))
+                .collect();
+            format!("{}({})", name, arg_strs.join(", "))
+        },
     }
 }
 
-pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], depth: usize) -> String {
+pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction], depth: usize) -> String {
     let pad = "  ".repeat(depth);
     match s {
         Stmt::Assign { var, rhs } =>
             format!("{}{} = {};\n", pad, var_name(var_names, *var),
-                    emit_expr(rhs, var_names, buf_decls)),
+                    emit_expr(rhs, var_names, buf_decls, funcs)),
         Stmt::BufWrite { buf, idx, val } =>
             format!("{}{}[{}] = {};\n", pad, buf_name(buf_decls, *buf),
-                    emit_expr(idx, var_names, buf_decls), emit_expr(val, var_names, buf_decls)),
+                    emit_expr(idx, var_names, buf_decls, funcs),
+                    emit_expr(val, var_names, buf_decls, funcs)),
+        Stmt::CallStmt { fn_id, args, result_var } => {
+            let name = fn_name(funcs, *fn_id);
+            let arg_strs: Vec<String> = args.iter()
+                .map(|a| emit_expr(a, var_names, buf_decls, funcs))
+                .collect();
+            format!("{}{} = {}({});\n", pad, var_name(var_names, *result_var),
+                    name, arg_strs.join(", "))
+        },
         Stmt::Seq { first, then } => {
-            let mut s = emit_stmt(first, var_names, buf_decls, depth);
-            s.push_str(&emit_stmt(then, var_names, buf_decls, depth));
+            let mut s = emit_stmt(first, var_names, buf_decls, funcs, depth);
+            s.push_str(&emit_stmt(then, var_names, buf_decls, funcs, depth));
             s
         },
         Stmt::If { cond, then_body, else_body } => {
-            let mut s = format!("{}if ({}) {{\n", pad, emit_expr(cond, var_names, buf_decls));
-            s.push_str(&emit_stmt(then_body, var_names, buf_decls, depth + 1));
+            let mut s = format!("{}if ({}) {{\n", pad, emit_expr(cond, var_names, buf_decls, funcs));
+            s.push_str(&emit_stmt(then_body, var_names, buf_decls, funcs, depth + 1));
             s.push_str(&format!("{}}} else {{\n", pad));
-            s.push_str(&emit_stmt(else_body, var_names, buf_decls, depth + 1));
+            s.push_str(&emit_stmt(else_body, var_names, buf_decls, funcs, depth + 1));
             s.push_str(&format!("{}}}\n", pad));
             s
         },
         Stmt::For { var, start, end, body } => {
             let vn = var_name(var_names, *var);
             let mut s = format!("{}for (var {}: u32 = {}; {} < {}; {}++) {{\n",
-                pad, vn, emit_expr(start, var_names, buf_decls),
-                vn, emit_expr(end, var_names, buf_decls), vn);
-            s.push_str(&emit_stmt(body, var_names, buf_decls, depth + 1));
+                pad, vn, emit_expr(start, var_names, buf_decls, funcs),
+                vn, emit_expr(end, var_names, buf_decls, funcs), vn);
+            s.push_str(&emit_stmt(body, var_names, buf_decls, funcs, depth + 1));
             s.push_str(&format!("{}}}\n", pad));
             s
         },
@@ -114,6 +135,38 @@ pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], depth: u
     }
 }
 
+/// Emit a helper function as WGSL.
+fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction]) -> String {
+    let mut s = String::new();
+
+    let ret_ty = f.ret_type.map(|t| scalar_type_str(&t)).unwrap_or("u32");
+
+    // Signature
+    let param_strs: Vec<String> = f.params.iter()
+        .map(|(name, ty)| format!("{}: {}", name, scalar_type_str(ty)))
+        .collect();
+    s.push_str(&format!("fn {}({}) -> {} {{\n", f.name, param_strs.join(", "), ret_ty));
+
+    // Declare local variables (skip params, they're declared in signature)
+    let param_count = f.params.len();
+    for i in param_count..f.var_names.len() {
+        let vn = &f.var_names[i];
+        if vn == "__ret" { continue; } // declared as return value
+        s.push_str(&format!("  var {}: {};\n", vn, ret_ty));
+    }
+
+    // Return value
+    s.push_str(&format!("  var __ret: {};\n", ret_ty));
+
+    // Body — use empty buf_decls since helpers don't access buffers directly
+    let empty_bufs: Vec<BufDecl> = Vec::new();
+    s.push_str(&emit_stmt(&f.body, &f.var_names, &empty_bufs, all_funcs, 1));
+
+    s.push_str(&format!("  return __ret;\n"));
+    s.push_str("}\n\n");
+    s
+}
+
 pub fn emit_kernel(k: &Kernel) -> String {
     let mut s = String::new();
 
@@ -124,6 +177,11 @@ pub fn emit_kernel(k: &Kernel) -> String {
             buf.binding, access, buf.name, scalar_type_str(&buf.elem_type)));
     }
     s.push('\n');
+
+    // Helper functions (emitted before the kernel entry point)
+    for f in &k.functions {
+        s.push_str(&emit_function(f, &k.functions));
+    }
 
     // Entry point
     s.push_str(&format!("@compute @workgroup_size({}, {}, {})\n",
@@ -137,7 +195,7 @@ pub fn emit_kernel(k: &Kernel) -> String {
     }
 
     // Body
-    s.push_str(&emit_stmt(&k.body, &k.var_names, &k.buf_decls, 1));
+    s.push_str(&emit_stmt(&k.body, &k.var_names, &k.buf_decls, &k.functions, 1));
     s.push_str("}\n");
     s
 }

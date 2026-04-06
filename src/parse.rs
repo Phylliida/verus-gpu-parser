@@ -1,9 +1,14 @@
 ///  Tree-sitter based parser: Verus source → GPU Kernel IR.
 ///  Walks the CST and builds Kernel/Expr/Stmt types.
-///  This is the trusted component (~300 lines).
+///  This is the trusted component.
+///
+///  Function call support: parses all functions in the file, then does a
+///  reachability walk from the #[gpu_kernel] function to find helper functions.
+///  Only reachable helpers are included in the output.
 
 use tree_sitter::Node;
 use crate::types::*;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Parser state: source text + variable/buffer name tracking.
 struct ParseCtx<'a> {
@@ -11,6 +16,10 @@ struct ParseCtx<'a> {
     var_names: Vec<String>,     // local variable name → index
     buf_decls: Vec<BufDecl>,
     builtin_names: Vec<String>, // e.g., "gid.x"
+    /// Function name → fn_id mapping (shared across kernel + helpers).
+    fn_name_to_id: HashMap<String, u32>,
+    /// Names of functions called (collected during parsing for reachability).
+    called_fns: HashSet<String>,
 }
 
 impl<'a> ParseCtx<'a> {
@@ -32,9 +41,19 @@ impl<'a> ParseCtx<'a> {
     fn buf_idx(&self, name: &str) -> Option<u32> {
         self.buf_decls.iter().position(|b| b.name == name).map(|i| i as u32)
     }
+
+    fn fn_id(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.fn_name_to_id.get(name) {
+            id
+        } else {
+            let id = self.fn_name_to_id.len() as u32;
+            self.fn_name_to_id.insert(name.to_string(), id);
+            id
+        }
+    }
 }
 
-/// Parse a complete #[gpu_kernel] function from source.
+/// Parse a complete #[gpu_kernel] function + reachable helpers from source.
 pub fn parse_gpu_kernel(source: &str) -> Result<Kernel, String> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_verus::LANGUAGE.into())
@@ -45,23 +64,261 @@ pub fn parse_gpu_kernel(source: &str) -> Result<Kernel, String> {
 
     let root = tree.root_node();
 
-    // Find the function_item inside verus! { }
-    let fn_node = find_gpu_kernel_fn(&root, source)
+    // Phase 1: Find all function_item nodes in the file
+    let all_fns = find_all_functions(&root, source);
+
+    // Phase 2: Find the #[gpu_kernel] function
+    let kernel_fn_node = find_gpu_kernel_fn(&root, source)
         .ok_or_else(|| "No #[gpu_kernel] function found".to_string())?;
 
-    parse_fn_to_kernel(&fn_node, source)
+    // Phase 3: Parse the kernel function body
+    let mut ctx = ParseCtx {
+        source,
+        var_names: Vec::new(),
+        buf_decls: Vec::new(),
+        builtin_names: Vec::new(),
+        fn_name_to_id: HashMap::new(),
+        called_fns: HashSet::new(),
+    };
+
+    let name = kernel_fn_node.child_by_field_name("name")
+        .map(|n| n.utf8_text(source.as_bytes()).unwrap_or("kernel").to_string())
+        .unwrap_or_else(|| "kernel".to_string());
+
+    let workgroup_size = parse_workgroup_size(&kernel_fn_node, source);
+
+    if let Some(params) = kernel_fn_node.child_by_field_name("parameters") {
+        parse_parameters(&params, &mut ctx);
+    }
+
+    let body = if let Some(body_node) = kernel_fn_node.child_by_field_name("body") {
+        parse_block(&body_node, &mut ctx)?
+    } else {
+        Stmt::Noop
+    };
+
+    // Phase 4: Reachability walk — find all transitively called functions
+    let mut reachable: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = ctx.called_fns.iter().cloned().collect();
+
+    while let Some(fn_name) = queue.pop_front() {
+        if visited.contains(&fn_name) { continue; }
+        if !all_fns.contains_key(&fn_name) { continue; } // external/unknown
+        visited.insert(fn_name.clone());
+        reachable.push(fn_name.clone());
+
+        // Parse this function to discover ITS callees
+        let fn_node = &all_fns[&fn_name];
+        let mut helper_ctx = ParseCtx {
+            source,
+            var_names: Vec::new(),
+            buf_decls: Vec::new(), // helpers don't have buffers
+            builtin_names: Vec::new(),
+            fn_name_to_id: ctx.fn_name_to_id.clone(),
+            called_fns: HashSet::new(),
+        };
+        // Parse helper params as regular variables
+        if let Some(params) = fn_node.child_by_field_name("parameters") {
+            parse_helper_parameters(&params, &mut helper_ctx);
+        }
+        if let Some(body_node) = fn_node.child_by_field_name("body") {
+            let _ = parse_block(&body_node, &mut helper_ctx);
+        }
+        // Merge fn_name_to_id back (new functions may have been discovered)
+        for (k, v) in &helper_ctx.fn_name_to_id {
+            ctx.fn_name_to_id.entry(k.clone()).or_insert(*v);
+        }
+        // Enqueue newly discovered callees
+        for callee in &helper_ctx.called_fns {
+            if !visited.contains(callee) {
+                queue.push_back(callee.clone());
+            }
+        }
+    }
+
+    // Phase 5: Parse reachable functions into GpuFunction structs
+    // Assign stable fn_ids based on order discovered
+    let mut fn_id_map: HashMap<String, u32> = HashMap::new();
+    let mut functions: Vec<GpuFunction> = Vec::new();
+
+    for (i, fn_name) in reachable.iter().enumerate() {
+        fn_id_map.insert(fn_name.clone(), i as u32);
+    }
+
+    for fn_name in &reachable {
+        let fn_node = &all_fns[fn_name];
+        let func = parse_helper_function(fn_node, source, &fn_id_map)?;
+        functions.push(func);
+    }
+
+    // Phase 6: Re-parse kernel body with final fn_id_map so CallStmt/Call IDs are correct
+    let mut final_ctx = ParseCtx {
+        source,
+        var_names: Vec::new(),
+        buf_decls: Vec::new(),
+        builtin_names: Vec::new(),
+        fn_name_to_id: fn_id_map.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+        called_fns: HashSet::new(),
+    };
+
+    if let Some(params) = kernel_fn_node.child_by_field_name("parameters") {
+        parse_parameters(&params, &mut final_ctx);
+    }
+
+    let final_body = if let Some(body_node) = kernel_fn_node.child_by_field_name("body") {
+        parse_block(&body_node, &mut final_ctx)?
+    } else {
+        Stmt::Noop
+    };
+
+    let fn_name_to_id_vec: Vec<(String, u32)> = fn_id_map.into_iter().collect();
+
+    Ok(Kernel {
+        name,
+        var_names: final_ctx.var_names,
+        buf_decls: final_ctx.buf_decls,
+        body: final_body,
+        workgroup_size,
+        builtin_names: final_ctx.builtin_names,
+        functions,
+        fn_name_to_id: fn_name_to_id_vec,
+    })
+}
+
+/// Find all function_item nodes in the file, keyed by name.
+fn find_all_functions<'a>(node: &Node<'a>, source: &str) -> HashMap<String, Node<'a>> {
+    let mut result = HashMap::new();
+    collect_functions(node, source, &mut result);
+    result
+}
+
+fn collect_functions<'a>(node: &Node<'a>, source: &str, result: &mut HashMap<String, Node<'a>>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "function_item" => {
+                if let Some(name_node) = child.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    if !name.is_empty() {
+                        result.insert(name, child);
+                    }
+                }
+            },
+            _ => collect_functions(&child, source, result),
+        }
+    }
+}
+
+/// Parse a helper function into a GpuFunction.
+fn parse_helper_function(
+    fn_node: &Node, source: &str, fn_id_map: &HashMap<String, u32>,
+) -> Result<GpuFunction, String> {
+    let mut ctx = ParseCtx {
+        source,
+        var_names: Vec::new(),
+        buf_decls: Vec::new(),
+        builtin_names: Vec::new(),
+        fn_name_to_id: fn_id_map.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+        called_fns: HashSet::new(),
+    };
+
+    let name = fn_node.child_by_field_name("name")
+        .map(|n| n.utf8_text(source.as_bytes()).unwrap_or("f").to_string())
+        .unwrap_or_else(|| "f".to_string());
+
+    // Parse parameters as regular typed variables
+    let mut params = Vec::new();
+    if let Some(params_node) = fn_node.child_by_field_name("parameters") {
+        params = parse_typed_parameters(&params_node, &mut ctx);
+    }
+
+    // Parse return type
+    let ret_type = parse_return_type(fn_node, source);
+
+    // Create return variable
+    let ret_var = ctx.var_idx("__ret");
+
+    let body = if let Some(body_node) = fn_node.child_by_field_name("body") {
+        parse_block(&body_node, &mut ctx)?
+    } else {
+        Stmt::Noop
+    };
+
+    Ok(GpuFunction {
+        name,
+        params,
+        ret_type,
+        var_names: ctx.var_names,
+        body,
+        ret_var,
+    })
+}
+
+/// Parse parameters as typed variables (for helper functions, not kernel).
+fn parse_typed_parameters(params_node: &Node, ctx: &mut ParseCtx) -> Vec<(String, ScalarType)> {
+    let mut result = Vec::new();
+    let mut cursor = params_node.walk();
+    let children: Vec<Node> = params_node.children(&mut cursor).collect();
+
+    for child in &children {
+        if child.kind() == "parameter" {
+            let name = extract_param_name(child, ctx.source);
+            let text = ctx.text(child);
+            let ty = infer_scalar_type(text);
+            ctx.var_idx(&name);
+            result.push((name, ty));
+        }
+    }
+    result
+}
+
+/// Parse helper function parameters (just add them as variables, skip attributes).
+fn parse_helper_parameters(params_node: &Node, ctx: &mut ParseCtx) {
+    let mut cursor = params_node.walk();
+    for child in params_node.children(&mut cursor) {
+        if child.kind() == "parameter" {
+            let name = extract_param_name(&child, ctx.source);
+            ctx.var_idx(&name);
+        }
+    }
+}
+
+/// Infer scalar type from parameter text like "x: u32" or "a: i32".
+fn infer_scalar_type(param_text: &str) -> ScalarType {
+    if param_text.contains("i32") { ScalarType::I32 }
+    else if param_text.contains("f32") { ScalarType::F32 }
+    else if param_text.contains("f16") { ScalarType::F16 }
+    else if param_text.contains("bool") { ScalarType::Bool }
+    else { ScalarType::U32 }
+}
+
+/// Parse return type from function signature.
+fn parse_return_type(fn_node: &Node, source: &str) -> Option<ScalarType> {
+    let text = fn_node.utf8_text(source.as_bytes()).unwrap_or("");
+    // Look for "-> TYPE" pattern before the body "{"
+    if let Some(arrow_pos) = text.find("->") {
+        let after = &text[arrow_pos + 2..];
+        let ty_text = after.split(|c: char| c == '{' || c == '\n')
+            .next().unwrap_or("").trim();
+        // Strip Verus return name pattern: (name: Type)
+        let ty_text = if ty_text.starts_with('(') && ty_text.contains(':') {
+            ty_text.split(':').last().unwrap_or("").trim().trim_end_matches(')')
+        } else {
+            ty_text
+        };
+        return Some(infer_scalar_type(ty_text));
+    }
+    None
 }
 
 /// Recursively find a function_item with #[gpu_kernel] attribute.
-/// In tree-sitter, attributes are often part of the function_item node
-/// (as children), or may be preceding siblings. We check both.
 fn find_gpu_kernel_fn<'a>(node: &Node<'a>, source: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
     let children: Vec<Node<'a>> = node.children(&mut cursor).collect();
     let mut prev_has_gpu_kernel = false;
 
     for child in &children {
-        // Check if this node itself contains gpu_kernel (e.g., attribute_item)
         let text = child.utf8_text(source.as_bytes()).unwrap_or("");
         if text.contains("gpu_kernel") {
             prev_has_gpu_kernel = true;
@@ -69,19 +326,15 @@ fn find_gpu_kernel_fn<'a>(node: &Node<'a>, source: &str) -> Option<Node<'a>> {
 
         match child.kind() {
             "function_item" => {
-                // The function_item in tree-sitter-verus includes its attributes
-                // as children. Check the full node text.
                 if text.contains("gpu_kernel") || prev_has_gpu_kernel {
                     return Some(*child);
                 }
                 prev_has_gpu_kernel = false;
             },
             _ => {
-                // Recurse into containers
                 if let Some(f) = find_gpu_kernel_fn(child, source) {
                     return Some(f);
                 }
-                // Reset flag if this wasn't an attribute
                 if !text.contains("gpu_kernel") {
                     prev_has_gpu_kernel = false;
                 }
@@ -91,49 +344,9 @@ fn find_gpu_kernel_fn<'a>(node: &Node<'a>, source: &str) -> Option<Node<'a>> {
     None
 }
 
-/// Parse a function_item node into a Kernel.
-fn parse_fn_to_kernel(fn_node: &Node, source: &str) -> Result<Kernel, String> {
-    let mut ctx = ParseCtx {
-        source,
-        var_names: Vec::new(),
-        buf_decls: Vec::new(),
-        builtin_names: Vec::new(),
-    };
-
-    // Extract function name
-    let name = fn_node.child_by_field_name("name")
-        .map(|n| n.utf8_text(source.as_bytes()).unwrap_or("kernel").to_string())
-        .unwrap_or_else(|| "kernel".to_string());
-
-    // Parse workgroup_size from attributes
-    let workgroup_size = parse_workgroup_size(fn_node, source);
-
-    // Parse parameters — identify builtins and buffers
-    if let Some(params) = fn_node.child_by_field_name("parameters") {
-        parse_parameters(&params, &mut ctx);
-    }
-
-    // Parse body
-    let body = if let Some(body_node) = fn_node.child_by_field_name("body") {
-        parse_block(&body_node, &mut ctx)?
-    } else {
-        Stmt::Noop
-    };
-
-    Ok(Kernel {
-        name,
-        var_names: ctx.var_names,
-        buf_decls: ctx.buf_decls,
-        body,
-        workgroup_size,
-        builtin_names: ctx.builtin_names,
-    })
-}
-
 /// Extract workgroup_size(X, Y, Z) from #[gpu_kernel(...)] attribute.
 fn parse_workgroup_size(fn_node: &Node, source: &str) -> (u32, u32, u32) {
     let text = fn_node.utf8_text(source.as_bytes()).unwrap_or("");
-    // Simple regex-free extraction: find "workgroup_size(" and parse numbers
     if let Some(start) = text.find("workgroup_size(") {
         let rest = &text[start + "workgroup_size(".len()..];
         if let Some(end) = rest.find(')') {
@@ -147,11 +360,10 @@ fn parse_workgroup_size(fn_node: &Node, source: &str) -> (u32, u32, u32) {
             );
         }
     }
-    (256, 1, 1) // default
+    (256, 1, 1)
 }
 
 /// Parse function parameters — identify builtins (#[gpu_builtin]) and buffers (#[gpu_buffer]).
-/// Attributes appear as `attribute_item` siblings BEFORE their `parameter` node.
 fn parse_parameters(params_node: &Node, ctx: &mut ParseCtx) {
     let mut cursor = params_node.walk();
     let children: Vec<Node> = params_node.children(&mut cursor).collect();
@@ -163,7 +375,6 @@ fn parse_parameters(params_node: &Node, ctx: &mut ParseCtx) {
         let text = ctx.text(child);
 
         if kind == "attribute_item" {
-            // Store attribute text for the next parameter
             pending_attr = Some(text.to_string());
             continue;
         }
@@ -195,11 +406,9 @@ fn parse_parameters(params_node: &Node, ctx: &mut ParseCtx) {
 }
 
 fn extract_param_name(param_node: &Node, source: &str) -> String {
-    // Find the identifier in the parameter
     if let Some(pattern) = param_node.child_by_field_name("pattern") {
         return pattern.utf8_text(source.as_bytes()).unwrap_or("x").to_string();
     }
-    // Fallback: scan children for identifier
     let mut cursor = param_node.walk();
     for child in param_node.children(&mut cursor) {
         if child.kind() == "identifier" {
@@ -221,14 +430,25 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
             "expression_statement" => stmts.push(parse_expr_stmt(&child, ctx)?),
             "if_expression" => stmts.push(parse_if(&child, ctx)?),
             "for_expression" => stmts.push(parse_for(&child, ctx)?),
-            "return_expression" => stmts.push(Stmt::Return),
+            "return_expression" => {
+                // return expr → assign to __ret + Return
+                if let Some(val) = child.child(1) {
+                    if val.kind() != ";" {
+                        let rhs = parse_expr(&val, ctx)?;
+                        let ret_var = ctx.var_idx("__ret");
+                        stmts.push(Stmt::Assign { var: ret_var, rhs });
+                    }
+                }
+                stmts.push(Stmt::Return);
+            },
             "break_expression" => stmts.push(Stmt::Break),
             "continue_expression" => stmts.push(Stmt::Continue),
             // Skip Verus-specific clauses
             "requires_clause" | "ensures_clause" | "decreases_clause"
             | "invariant_clause" | "recommends_clause" => {},
+            // Skip proof blocks and ghost code
+            "proof_block" | "ghost_block" => {},
             _ => {
-                // Try to parse as expression statement
                 if let Ok(s) = parse_expr_to_stmt(&child, ctx) {
                     stmts.push(s);
                 }
@@ -242,7 +462,6 @@ fn parse_let(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
     let name = node.child_by_field_name("pattern")
         .map(|n| ctx.text(&n).to_string())
         .unwrap_or_else(|| "tmp".to_string());
-    // Strip "mut " prefix if present
     let name = name.strip_prefix("mut ").unwrap_or(&name).trim().to_string();
     let var = ctx.var_idx(&name);
 
@@ -256,8 +475,6 @@ fn parse_let(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
 }
 
 fn parse_expr_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
-    // An expression statement wraps an inner expression + ";".
-    // Unwrap and dispatch based on the inner node's kind.
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -302,7 +519,7 @@ fn parse_expr_to_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
                 .map(|n| ctx.text(&n).to_string())
                 .unwrap_or_default();
             if let Some(buf) = ctx.buf_idx(&buf_name_str) {
-                let idx_node = lhs_node.child(2) // skip '['
+                let idx_node = lhs_node.child(2)
                     .or_else(|| lhs_node.child_by_field_name("index"))
                     .ok_or("buffer write missing index")?;
                 let idx = parse_expr(&idx_node, ctx)?;
@@ -317,8 +534,50 @@ fn parse_expr_to_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
         return Ok(Stmt::Assign { var, rhs });
     }
 
-    // Expression as statement (e.g., function call)
+    // Function call as statement: f(args) → CallStmt with result discarded
+    if node.kind() == "call_expression" {
+        if let Some(call_stmt) = try_parse_call_stmt(node, ctx)? {
+            return Ok(call_stmt);
+        }
+    }
+
     Ok(Stmt::Noop)
+}
+
+/// Try to parse a call_expression as a CallStmt.
+fn try_parse_call_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Option<Stmt>, String> {
+    let func_node = node.child_by_field_name("function")
+        .ok_or("call missing function")?;
+    let func_name = ctx.text(&func_node).to_string();
+
+    // Skip Verus proof/ghost functions
+    if func_name.starts_with("proof") || func_name.starts_with("ghost")
+        || func_name.starts_with("assert") || func_name.starts_with("reveal")
+        || func_name.starts_with("lemma_") {
+        return Ok(None);
+    }
+
+    let args = parse_call_args(node, ctx)?;
+    let fn_id = ctx.fn_id(&func_name);
+    ctx.called_fns.insert(func_name);
+    let result_var = ctx.var_idx("__call_tmp");
+
+    Ok(Some(Stmt::CallStmt { fn_id, args, result_var }))
+}
+
+/// Parse arguments from a call_expression.
+fn parse_call_args(call_node: &Node, ctx: &mut ParseCtx) -> Result<Vec<Expr>, String> {
+    let mut args = Vec::new();
+    let args_node = call_node.child_by_field_name("arguments")
+        .ok_or("call missing arguments")?;
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        match child.kind() {
+            "(" | ")" | "," => {},
+            _ => args.push(parse_expr(&child, ctx)?),
+        }
+    }
+    Ok(args)
 }
 
 fn parse_if(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
@@ -331,7 +590,6 @@ fn parse_if(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
     let then_body = parse_block(&then_node, ctx)?;
 
     let else_body = if let Some(alt) = node.child_by_field_name("alternative") {
-        // Could be another if (else if) or a block (else)
         if alt.kind() == "else_clause" {
             let mut cursor = alt.walk();
             let mut result = Stmt::Noop;
@@ -354,13 +612,11 @@ fn parse_if(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
 }
 
 fn parse_for(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
-    // for VAR in START..END { body }
     let pat = node.child_by_field_name("pattern")
         .map(|n| ctx.text(&n).to_string())
         .unwrap_or_else(|| "i".to_string());
     let var = ctx.var_idx(&pat);
 
-    // Parse range expression (start..end)
     let value_node = node.child_by_field_name("value")
         .ok_or("for missing range")?;
     let (start, end) = parse_range(&value_node, ctx)?;
@@ -373,7 +629,6 @@ fn parse_for(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
 }
 
 fn parse_range(node: &Node, ctx: &mut ParseCtx) -> Result<(Expr, Expr), String> {
-    // range_expression: start..end
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
 
@@ -396,7 +651,6 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
                 else if text.ends_with("i64") { ScalarType::I32 }
                 else if text.ends_with("f32") { ScalarType::F32 }
                 else { ScalarType::U32 };
-            //  Strip type suffix: u32, i32, u64, i64, usize, etc.
             let num_str = text.trim_end_matches("u32").trim_end_matches("i32")
                 .trim_end_matches("u64").trim_end_matches("i64")
                 .trim_end_matches("usize").trim_end_matches("isize")
@@ -413,9 +667,7 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
         "true" => Ok(Expr::Const(1, ScalarType::Bool)),
         "false" => Ok(Expr::Const(0, ScalarType::Bool)),
         "identifier" | "scoped_identifier" => {
-            // Check if it's a buffer name
-            if let Some(buf) = ctx.buf_idx(text) {
-                // Bare buffer reference — shouldn't happen in normal code
+            if let Some(_buf) = ctx.buf_idx(text) {
                 Ok(Expr::Var(ctx.var_idx(text)))
             } else {
                 Ok(Expr::Var(ctx.var_idx(text)))
@@ -454,22 +706,18 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
             Ok(Expr::UnaryOp(op, Box::new(parse_expr(&operand, ctx)?)))
         },
         "index_expression" => {
-            // buf[idx]
             let base = node.child(0).ok_or("index missing base")?;
             let base_text = ctx.text(&base);
             if let Some(buf) = ctx.buf_idx(base_text) {
-                // Find the index expression (between [ and ])
                 let idx_node = node.child(2)
                     .ok_or("index missing index expr")?;
                 let idx = parse_expr(&idx_node, ctx)?;
                 Ok(Expr::ArrayRead(buf, Box::new(idx)))
             } else {
-                // Variable indexing (not a buffer)
                 Ok(Expr::Var(ctx.var_idx(base_text)))
             }
         },
         "parenthesized_expression" => {
-            // (expr) — unwrap parens
             let inner = node.child(1).ok_or("paren missing inner")?;
             parse_expr(&inner, ctx)
         },
@@ -485,16 +733,16 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
             Ok(Expr::Cast(ty, Box::new(parse_expr(&inner, ctx)?)))
         },
         "call_expression" => {
-            // Function call — for now, only barrier calls are handled as stmts
-            // Other calls get inlined or become CallStmt
+            // Function call as expression: f(args) → Call(fn_id, args)
             let func = node.child_by_field_name("function")
                 .ok_or("call missing function")?;
-            let func_name = ctx.text(&func);
-            // Simple: treat as variable reference for now
-            Ok(Expr::Var(ctx.var_idx(func_name)))
+            let func_name = ctx.text(&func).to_string();
+            let args = parse_call_args(node, ctx)?;
+            let fn_id = ctx.fn_id(&func_name);
+            ctx.called_fns.insert(func_name);
+            Ok(Expr::Call(fn_id, args))
         },
         _ => {
-            // Fallback: try to parse as a number or variable
             if let Ok(val) = text.trim().parse::<i64>() {
                 Ok(Expr::Const(val, ScalarType::I32))
             } else {
