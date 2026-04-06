@@ -31,12 +31,20 @@ impl<'a> ParseCtx<'a> {
     }
 
     /// Get or create a variable index for the given name.
+    /// Renames WGSL-invalid identifiers (bare `_` → `_unused_N`).
     fn var_idx(&mut self, name: &str) -> u32 {
-        if let Some(idx) = self.var_names.iter().position(|n| n == name) {
+        // WGSL doesn't allow bare `_` as identifier
+        let safe_name = if name == "_" {
+            let n = self.var_names.len();
+            format!("_unused_{}", n)
+        } else {
+            name.to_string()
+        };
+        if let Some(idx) = self.var_names.iter().position(|n| n == &safe_name) {
             idx as u32
         } else {
             let idx = self.var_names.len() as u32;
-            self.var_names.push(name.to_string());
+            self.var_names.push(safe_name);
             idx
         }
     }
