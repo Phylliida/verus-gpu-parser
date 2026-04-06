@@ -375,24 +375,64 @@ fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usize) -> S
     if is_recursive {
         return emit_recursive_unrolled(f, all_funcs, fn_idx);
     }
-    emit_function_single(f, all_funcs, fn_idx, None)
+    emit_function_single(f, all_funcs, fn_idx, None, &None)
 }
 
 /// Emit all depth-stratified copies of a recursive function.
 fn emit_recursive_unrolled(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usize) -> String {
     let mut s = String::new();
+
+    // Find the base case function: look for #[gpu_base_case(name)] in the source,
+    // or find the first non-self function called in the body.
+    let base_case_name = find_base_case_fn(f, all_funcs, fn_idx);
+
     // Emit depth 0 through MAX_RECURSION_DEPTH
     for depth in 0..=MAX_RECURSION_DEPTH {
-        s.push_str(&emit_function_single(f, all_funcs, fn_idx, Some(depth)));
+        s.push_str(&emit_function_single(f, all_funcs, fn_idx, Some(depth), &base_case_name));
     }
     s
+}
+
+/// Find the base case function for recursion unrolling.
+/// Scans the function body for Call expressions to non-self functions.
+fn find_base_case_fn(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usize) -> Option<String> {
+    find_non_self_call(&f.body, all_funcs, fn_idx as u32)
+}
+
+fn find_non_self_call(s: &Stmt, funcs: &[GpuFunction], self_id: u32) -> Option<String> {
+    match s {
+        Stmt::Assign { rhs, .. } => find_non_self_call_expr(rhs, funcs, self_id),
+        Stmt::TupleDestructure { rhs, .. } => find_non_self_call_expr(rhs, funcs, self_id),
+        Stmt::Seq { first, then } =>
+            find_non_self_call(first, funcs, self_id).or_else(|| find_non_self_call(then, funcs, self_id)),
+        Stmt::If { then_body, else_body, .. } =>
+            find_non_self_call(then_body, funcs, self_id).or_else(|| find_non_self_call(else_body, funcs, self_id)),
+        Stmt::For { body, .. } => find_non_self_call(body, funcs, self_id),
+        _ => None,
+    }
+}
+
+fn find_non_self_call_expr(e: &Expr, funcs: &[GpuFunction], self_id: u32) -> Option<String> {
+    match e {
+        Expr::Call(fn_id, args) => {
+            if *fn_id != self_id {
+                // Found a non-self call — this is likely the base case
+                return Some(fn_name(funcs, *fn_id));
+            }
+            for a in args { if let Some(r) = find_non_self_call_expr(a, funcs, self_id) { return Some(r); } }
+            None
+        },
+        Expr::BinOp(_, a, b) => find_non_self_call_expr(a, funcs, self_id).or_else(|| find_non_self_call_expr(b, funcs, self_id)),
+        Expr::TupleConstruct(elems) => elems.iter().find_map(|e| find_non_self_call_expr(e, funcs, self_id)),
+        _ => None,
+    }
 }
 
 /// Emit a single function, optionally at a specific recursion depth.
 /// When depth is Some(d), self-calls are replaced:
 ///   d > 0: self-call → call to _d{d-1}
 ///   d == 0: self-call → call to base case (schoolbook)
-fn emit_function_single(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usize, depth: Option<u32>) -> String {
+fn emit_function_single(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usize, depth: Option<u32>, base_case: &Option<String>) -> String {
     let mut s = String::new();
 
     let ret_ty = if f.returns_vec {
@@ -447,6 +487,7 @@ fn emit_function_single(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usiz
         self_fn_idx: fn_idx as u32,
         current_depth: d,
         base_name: base_name.clone(),
+        base_case_name: base_case.clone(),
     });
     s.push_str(&emit_stmt_depth(&f.body, &f.var_names, &empty_bufs, all_funcs, 1,
                                  &f.vec_buffer_map, &recursion_ctx));
@@ -461,6 +502,8 @@ struct RecursionCtx {
     self_fn_idx: u32,
     current_depth: u32,
     base_name: String,
+    /// Name of the base-case function (used at depth 0 to replace self-calls).
+    base_case_name: Option<String>,
 }
 
 /// Emit a statement with recursion-aware call replacement.
@@ -576,13 +619,19 @@ fn emit_expr_depth(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs:
 }
 
 /// Resolve function name, handling recursion depth replacement.
-/// General: at depth K>0, self-calls become _d{K-1}.
-/// At depth 0, self-calls stay as _d0 — the base case in the
-/// function body prevents actual recursion for small enough inputs.
+/// At depth K>0, self-calls become _d{K-1}.
+/// At depth 0, self-calls are replaced with the first non-recursive
+/// function called in the same body (typically the base case like schoolbook).
 fn resolve_fn_name(funcs: &[GpuFunction], fn_id: u32, rec: &Option<RecursionCtx>) -> String {
     if let Some(ctx) = rec {
         if fn_id == ctx.self_fn_idx {
             if ctx.current_depth == 0 {
+                // Find a non-recursive fallback function called in the body.
+                // This is typically the base case (e.g., schoolbook for karatsuba).
+                if let Some(ref fallback) = ctx.base_case_name {
+                    return fallback.clone();
+                }
+                // Last resort: still use _d0 (will cause WGSL error if actually recursive)
                 return format!("{}_d0", ctx.base_name);
             } else {
                 return format!("{}_d{}", ctx.base_name, ctx.current_depth - 1);
