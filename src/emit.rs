@@ -57,10 +57,24 @@ fn buf_name(decls: &[BufDecl], idx: u32) -> String {
 }
 
 fn fn_name(funcs: &[GpuFunction], idx: u32) -> String {
-    funcs.get(idx as usize).map(|f| f.name.clone()).unwrap_or_else(|| format!("fn_{}", idx))
+    funcs.get(idx as usize).map(|f| {
+        if f.vec_buffer_map.is_empty() {
+            f.name.clone()
+        } else {
+            let buf_suffix: Vec<&str> = f.vec_buffer_map.iter()
+                .map(|(_, buf)| buf.as_str())
+                .collect();
+            format!("{}_{}", f.name, buf_suffix.join("_"))
+        }
+    }).unwrap_or_else(|| format!("fn_{}", idx))
 }
 
 pub fn emit_expr(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction]) -> String {
+    emit_expr_ctx(e, var_names, buf_decls, funcs, &[])
+}
+
+/// Emit an expression. `vec_buf_map` maps var_name → buffer_name for Vec params.
+fn emit_expr_ctx(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction], vec_buf_map: &[(String, String)]) -> String {
     match e {
         Expr::Const(val, ty) => match ty {
             ScalarType::F32 | ScalarType::F16 => format!("{}.0f", val),
@@ -71,68 +85,75 @@ pub fn emit_expr(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs: &
         Expr::Var(idx) => var_name(var_names, *idx),
         Expr::Builtin(idx) => var_name(var_names, *idx),
         Expr::BinOp(op, a, b) =>
-            format!("({} {} {})", emit_expr(a, var_names, buf_decls, funcs),
-                    binop_str(op), emit_expr(b, var_names, buf_decls, funcs)),
+            format!("({} {} {})", emit_expr_ctx(a, var_names, buf_decls, funcs, vec_buf_map),
+                    binop_str(op), emit_expr_ctx(b, var_names, buf_decls, funcs, vec_buf_map)),
         Expr::UnaryOp(op, a) =>
-            format!("({}{})", unaryop_str(op), emit_expr(a, var_names, buf_decls, funcs)),
+            format!("({}{})", unaryop_str(op), emit_expr_ctx(a, var_names, buf_decls, funcs, vec_buf_map)),
         Expr::Select(c, t, f) =>
             format!("select({}, {}, {})",
-                    emit_expr(f, var_names, buf_decls, funcs),
-                    emit_expr(t, var_names, buf_decls, funcs),
-                    emit_expr(c, var_names, buf_decls, funcs)),
+                    emit_expr_ctx(f, var_names, buf_decls, funcs, vec_buf_map),
+                    emit_expr_ctx(t, var_names, buf_decls, funcs, vec_buf_map),
+                    emit_expr_ctx(c, var_names, buf_decls, funcs, vec_buf_map)),
         Expr::ArrayRead(buf, idx) =>
-            format!("{}[{}]", buf_name(buf_decls, *buf), emit_expr(idx, var_names, buf_decls, funcs)),
+            format!("{}[{}]", buf_name(buf_decls, *buf), emit_expr_ctx(idx, var_names, buf_decls, funcs, vec_buf_map)),
         Expr::Cast(ty, inner) =>
-            format!("{}({})", scalar_type_str(ty), emit_expr(inner, var_names, buf_decls, funcs)),
+            format!("{}({})", scalar_type_str(ty), emit_expr_ctx(inner, var_names, buf_decls, funcs, vec_buf_map)),
         Expr::Call(fn_id, args) => {
             let name = fn_name(funcs, *fn_id);
             let arg_strs: Vec<String> = args.iter()
-                .map(|a| emit_expr(a, var_names, buf_decls, funcs))
+                .map(|a| emit_expr_ctx(a, var_names, buf_decls, funcs, vec_buf_map))
                 .collect();
             format!("{}({})", name, arg_strs.join(", "))
         },
         Expr::TupleConstruct(elems) => {
             let arity = elems.len();
             let elem_strs: Vec<String> = elems.iter()
-                .map(|e| emit_expr(e, var_names, buf_decls, funcs))
+                .map(|e| emit_expr_ctx(e, var_names, buf_decls, funcs, vec_buf_map))
                 .collect();
             format!("{}({})", tuple_struct_name(arity), elem_strs.join(", "))
         },
         Expr::TupleAccess(base, idx) => {
-            format!("{}._{}", emit_expr(base, var_names, buf_decls, funcs), idx)
+            format!("{}._{}", emit_expr_ctx(base, var_names, buf_decls, funcs, vec_buf_map), idx)
         },
         Expr::ScratchRead(offset) => {
-            format!("scratch[{}]", emit_expr(offset, var_names, buf_decls, funcs))
+            format!("scratch[{}]", emit_expr_ctx(offset, var_names, buf_decls, funcs, vec_buf_map))
         },
         Expr::VecIndex(var, idx) => {
-            // Check if this var has a buffer mapping (from monomorphization)
             let vn = var_name(var_names, *var);
-            // Default to scratch; monomorphized functions override via var_name convention
-            format!("{}[({} + {})]", vn, vn,
-                    emit_expr(idx, var_names, buf_decls, funcs))
+            // Look up buffer name from vec_buf_map
+            let buf = vec_buf_map.iter()
+                .find(|(param, _)| param == &vn)
+                .map(|(_, buf)| buf.as_str())
+                .unwrap_or("scratch");
+            format!("{}[({} + {})]", buf, vn,
+                    emit_expr_ctx(idx, var_names, buf_decls, funcs, vec_buf_map))
         },
         Expr::BufSlice(buf, offset) => {
             // Buffer slice reference — should only appear as function argument,
             // not as a standalone expression. Emit as the offset.
-            emit_expr(offset, var_names, buf_decls, funcs)
+            emit_expr_ctx(offset, var_names, buf_decls, funcs, vec_buf_map)
         },
     }
 }
 
 pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction], depth: usize) -> String {
+    emit_stmt_ctx(s, var_names, buf_decls, funcs, depth, &[])
+}
+
+fn emit_stmt_ctx(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &[GpuFunction], depth: usize, vec_buf_map: &[(String, String)]) -> String {
     let pad = "  ".repeat(depth);
     match s {
         Stmt::Assign { var, rhs } =>
             format!("{}{} = {};\n", pad, var_name(var_names, *var),
-                    emit_expr(rhs, var_names, buf_decls, funcs)),
+                    emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map)),
         Stmt::BufWrite { buf, idx, val } =>
             format!("{}{}[{}] = {};\n", pad, buf_name(buf_decls, *buf),
-                    emit_expr(idx, var_names, buf_decls, funcs),
-                    emit_expr(val, var_names, buf_decls, funcs)),
+                    emit_expr_ctx(idx, var_names, buf_decls, funcs, vec_buf_map),
+                    emit_expr_ctx(val, var_names, buf_decls, funcs, vec_buf_map)),
         Stmt::CallStmt { fn_id, args, result_var } => {
             let name = fn_name(funcs, *fn_id);
             let arg_strs: Vec<String> = args.iter()
-                .map(|a| emit_expr(a, var_names, buf_decls, funcs))
+                .map(|a| emit_expr_ctx(a, var_names, buf_decls, funcs, vec_buf_map))
                 .collect();
             format!("{}{} = {}({});\n", pad, var_name(var_names, *result_var),
                     name, arg_strs.join(", "))
@@ -141,7 +162,7 @@ pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
             // let (a, b, c) = expr; → { var __td = expr; a = __td._0; b = __td._1; ... }
             // Use a block scope so __td doesn't conflict with other destructures.
             let mut s = format!("{}{{\n", pad);
-            s.push_str(&format!("{}  var __td = {};\n", pad, emit_expr(rhs, var_names, buf_decls, funcs)));
+            s.push_str(&format!("{}  var __td = {};\n", pad, emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map)));
             for (i, var) in vars.iter().enumerate() {
                 s.push_str(&format!("{}  {} = __td._{};\n", pad, var_name(var_names, *var), i));
             }
@@ -149,24 +170,24 @@ pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
             s
         },
         Stmt::Seq { first, then } => {
-            let mut s = emit_stmt(first, var_names, buf_decls, funcs, depth);
-            s.push_str(&emit_stmt(then, var_names, buf_decls, funcs, depth));
+            let mut s = emit_stmt_ctx(first, var_names, buf_decls, funcs, depth, vec_buf_map);
+            s.push_str(&emit_stmt_ctx(then, var_names, buf_decls, funcs, depth, vec_buf_map));
             s
         },
         Stmt::If { cond, then_body, else_body } => {
-            let mut s = format!("{}if ({}) {{\n", pad, emit_expr(cond, var_names, buf_decls, funcs));
-            s.push_str(&emit_stmt(then_body, var_names, buf_decls, funcs, depth + 1));
+            let mut s = format!("{}if ({}) {{\n", pad, emit_expr_ctx(cond, var_names, buf_decls, funcs, vec_buf_map));
+            s.push_str(&emit_stmt_ctx(then_body, var_names, buf_decls, funcs, depth + 1, vec_buf_map));
             s.push_str(&format!("{}}} else {{\n", pad));
-            s.push_str(&emit_stmt(else_body, var_names, buf_decls, funcs, depth + 1));
+            s.push_str(&emit_stmt_ctx(else_body, var_names, buf_decls, funcs, depth + 1, vec_buf_map));
             s.push_str(&format!("{}}}\n", pad));
             s
         },
         Stmt::For { var, start, end, body } => {
             let vn = var_name(var_names, *var);
             let mut s = format!("{}for (var {}: u32 = {}; {} < {}; {}++) {{\n",
-                pad, vn, emit_expr(start, var_names, buf_decls, funcs),
-                vn, emit_expr(end, var_names, buf_decls, funcs), vn);
-            s.push_str(&emit_stmt(body, var_names, buf_decls, funcs, depth + 1));
+                pad, vn, emit_expr_ctx(start, var_names, buf_decls, funcs, vec_buf_map),
+                vn, emit_expr_ctx(end, var_names, buf_decls, funcs, vec_buf_map), vn);
+            s.push_str(&emit_stmt_ctx(body, var_names, buf_decls, funcs, depth + 1, vec_buf_map));
             s.push_str(&format!("{}}}\n", pad));
             s
         },
@@ -182,14 +203,18 @@ pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
         },
         Stmt::ScratchWrite { offset, val } => {
             format!("{}scratch[{}] = {};\n", pad,
-                    emit_expr(offset, var_names, buf_decls, funcs),
-                    emit_expr(val, var_names, buf_decls, funcs))
+                    emit_expr_ctx(offset, var_names, buf_decls, funcs, vec_buf_map),
+                    emit_expr_ctx(val, var_names, buf_decls, funcs, vec_buf_map))
         },
         Stmt::VecPush { vec_var, val } => {
             let vn = var_name(var_names, *vec_var);
+            let buf = vec_buf_map.iter()
+                .find(|(param, _)| param == &vn)
+                .map(|(_, b)| b.as_str())
+                .unwrap_or("scratch");
             let len_var = format!("{}_len", vn);
-            format!("{}scratch[({} + {})] = {};\n{}{} = {} + 1u;\n",
-                    pad, vn, len_var, emit_expr(val, var_names, buf_decls, funcs),
+            format!("{}{}[({} + {})] = {};\n{}{} = {} + 1u;\n",
+                    pad, buf, vn, len_var, emit_expr_ctx(val, var_names, buf_decls, funcs, vec_buf_map),
                     pad, len_var, len_var)
         },
         Stmt::Return => format!("{}return;\n", pad),
@@ -321,9 +346,9 @@ fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction]) -> String {
     // Return value
     s.push_str(&format!("  var __ret: {};\n", ret_ty));
 
-    // Body
+    // Body — use vec_buffer_map for buffer-backed Vec params
     let empty_bufs: Vec<BufDecl> = Vec::new();
-    s.push_str(&emit_stmt(&f.body, &f.var_names, &empty_bufs, all_funcs, 1));
+    s.push_str(&emit_stmt_ctx(&f.body, &f.var_names, &empty_bufs, all_funcs, 1, &f.vec_buffer_map));
 
     s.push_str("  return __ret;\n");
     s.push_str("}\n\n");

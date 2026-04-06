@@ -198,6 +198,11 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         Stmt::Noop
     };
 
+    // Phase 7: Populate vec_buffer_map from call sites with BufSlice arguments.
+    // Walk the kernel body to find calls like generic_add_limbs(&a_buf[base..], &b_buf[base..], n)
+    // and map each Vec param to the buffer name it's called with.
+    populate_vec_buffer_maps(&final_body, &final_ctx.buf_decls, &mut functions);
+
     let fn_name_to_id_vec: Vec<(String, u32)> = fn_id_map.into_iter().collect();
 
     Ok(Kernel {
@@ -211,6 +216,68 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         fn_name_to_id: fn_name_to_id_vec,
         scratch_size: 0,
     })
+}
+
+/// Walk a statement tree to find Call expressions with BufSlice arguments.
+/// For each such call, populate the target function's vec_buffer_map.
+fn populate_vec_buffer_maps(body: &Stmt, buf_decls: &[BufDecl], functions: &mut Vec<GpuFunction>) {
+    match body {
+        Stmt::Assign { rhs, .. } => scan_expr_for_buf_calls(rhs, buf_decls, functions),
+        Stmt::TupleDestructure { rhs, .. } => scan_expr_for_buf_calls(rhs, buf_decls, functions),
+        Stmt::Seq { first, then } => {
+            populate_vec_buffer_maps(first, buf_decls, functions);
+            populate_vec_buffer_maps(then, buf_decls, functions);
+        },
+        Stmt::If { then_body, else_body, .. } => {
+            populate_vec_buffer_maps(then_body, buf_decls, functions);
+            populate_vec_buffer_maps(else_body, buf_decls, functions);
+        },
+        Stmt::For { body, .. } => populate_vec_buffer_maps(body, buf_decls, functions),
+        _ => {},
+    }
+}
+
+fn scan_expr_for_buf_calls(expr: &Expr, buf_decls: &[BufDecl], functions: &mut Vec<GpuFunction>) {
+    match expr {
+        Expr::Call(fn_id, args) => {
+            let fn_idx = *fn_id as usize;
+            if fn_idx < functions.len() {
+                let func = &functions[fn_idx];
+                let vec_params: Vec<String> = func.vec_params.clone();
+                let mut mappings: Vec<(String, String)> = Vec::new();
+
+                // Match BufSlice args to Vec params
+                let mut vec_param_idx = 0;
+                for arg in args {
+                    if let Expr::BufSlice(buf_id, _) = arg {
+                        if vec_param_idx < vec_params.len() {
+                            let buf_name = buf_decls.get(*buf_id as usize)
+                                .map(|b| b.name.clone())
+                                .unwrap_or_else(|| format!("buf_{}", buf_id));
+                            mappings.push((vec_params[vec_param_idx].clone(), buf_name));
+                            vec_param_idx += 1;
+                        }
+                    }
+                }
+
+                if !mappings.is_empty() {
+                    functions[fn_idx].vec_buffer_map = mappings;
+                }
+            }
+            // Recurse into args
+            for arg in args {
+                scan_expr_for_buf_calls(arg, buf_decls, functions);
+            }
+        },
+        Expr::BinOp(_, a, b) => {
+            scan_expr_for_buf_calls(a, buf_decls, functions);
+            scan_expr_for_buf_calls(b, buf_decls, functions);
+        },
+        Expr::TupleConstruct(elems) => {
+            for e in elems { scan_expr_for_buf_calls(e, buf_decls, functions); }
+        },
+        _ => {},
+    }
 }
 
 /// Discover callees from a function's source text (for imported functions).
