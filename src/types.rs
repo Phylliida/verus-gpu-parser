@@ -39,6 +39,9 @@ pub enum Expr {
     ScratchRead(Box<Expr>),
     /// Read from scratch at vec_var's offset + index: scratch[vec_off + idx]
     VecIndex(u32, Box<Expr>),       // (vec_var_id, index_expr)
+    /// Buffer slice reference: &buf[offset..] → (buf_id, offset_expr)
+    /// Used as argument to Vec-param functions for monomorphization.
+    BufSlice(u32, Box<Expr>),       // (buf_id, offset_expr)
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +113,9 @@ pub struct GpuFunction {
     /// If the function returns a Vec<u32> as part of its return type,
     /// the caller provides an output scratch offset as an extra parameter.
     pub returns_vec: bool,
+    /// Buffer names that back each Vec param (for monomorphized variants).
+    /// Empty for the "template" function; filled for monomorphized copies.
+    pub vec_buffer_map: Vec<(String, String)>,  // (param_name, buffer_name)
     pub var_names: Vec<String>,
     pub body: Stmt,
     pub ret_var: u32,

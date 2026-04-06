@@ -349,6 +349,7 @@ fn parse_helper_function(
         ret_type,
         vec_params,
         returns_vec,
+        vec_buffer_map: Vec::new(),
         var_names: ctx.var_names,
         body,
         ret_var,
@@ -590,7 +591,14 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
         let is_last = Some(child.id()) == last_meaningful;
         match kind {
             "{" | "}" => {},
-            "let_declaration" => stmts.push(parse_let(child, ctx)?),
+            "let_declaration" => {
+                // Skip ghost/proof let bindings
+                let text = ctx.text(child);
+                if text.contains("ghost ") || text.contains("Ghost") {
+                    continue;
+                }
+                stmts.push(parse_let(child, ctx)?);
+            },
             "expression_statement" => stmts.push(parse_expr_stmt(child, ctx)?),
             "if_expression" => {
                 if is_last {
@@ -602,6 +610,7 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
                 }
             },
             "for_expression" => stmts.push(parse_for(child, ctx)?),
+            "while_expression" => stmts.push(parse_while(child, ctx)?),
             "return_expression" => {
                 // return expr → assign to __ret + Return
                 let mut cursor2 = child.walk();
@@ -622,8 +631,12 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
             "requires_clause" | "ensures_clause" | "decreases_clause"
             | "invariant_clause" | "recommends_clause" => {},
             // Skip proof blocks and ghost code
-            "proof_block" | "ghost_block" => {},
+            "proof_block" | "ghost_block" | "assert_expr" => {},
             _ => {
+                // Debug: show unknown node types
+                eprintln!("  [parse_block] unknown node: kind={}, text={:.60}", kind,
+                    ctx.text(child).replace('\n', " "));
+
                 // Check if this is a bare expression (implicit return) at end of block
                 if is_last && kind != "expression_statement" {
                     // Bare expression without ; → implicit return
@@ -920,6 +933,43 @@ fn parse_for(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
     Ok(Stmt::For { var, start, end, body: Box::new(body) })
 }
 
+/// Parse a while loop. Emitted as WGSL `for (; cond;) { body }`.
+fn parse_while(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
+    let cond_node = node.child_by_field_name("condition")
+        .ok_or("while missing condition")?;
+    let cond = parse_expr(&cond_node, ctx)?;
+
+    let body_node = node.child_by_field_name("body")
+        .ok_or("while missing body")?;
+    let body = parse_block(&body_node, ctx)?;
+
+    // Emit as: for (var __w: u32 = 0u; cond; __w++) { body }
+    // Using a dummy variable since WGSL requires for syntax.
+    // Actually, WGSL has `loop { if (!cond) { break; } body }` but for is simpler.
+    // We'll use For with a large bound and break on !cond.
+    // Actually simplest: just emit as For(dummy, 0, large_n, if(!cond){break} + body)
+    // But better: detect "while i < n" pattern and emit as proper for.
+    //
+    // For now: emit as for(; true; ) with break-if-not-cond at start.
+    let break_check = Stmt::If {
+        cond: Expr::UnaryOp(UnaryOp::LogicalNot, Box::new(cond)),
+        then_body: Box::new(Stmt::Break),
+        else_body: Box::new(Stmt::Noop),
+    };
+    let full_body = Stmt::Seq {
+        first: Box::new(break_check),
+        then: Box::new(body),
+    };
+    // Use For with 0..0xFFFFFFFF as a "loop" — the break handles termination
+    let dummy = ctx.var_idx("__while_i");
+    Ok(Stmt::For {
+        var: dummy,
+        start: Expr::Const(0, ScalarType::U32),
+        end: Expr::Const(0xFFFFFFFF, ScalarType::U32),
+        body: Box::new(full_body),
+    })
+}
+
 fn parse_range(node: &Node, ctx: &mut ParseCtx) -> Result<(Expr, Expr), String> {
     let mut cursor = node.walk();
     let children: Vec<Node> = node.children(&mut cursor).collect();
@@ -1055,10 +1105,31 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
             Ok(Expr::Select(Box::new(cond), Box::new(then_expr), Box::new(else_expr)))
         },
         "reference_expression" | "borrow_expression" => {
-            // &expr or &mut expr → just strip the & and parse inner
+            // &expr or &mut expr
             let inner = node.child(1)
                 .or_else(|| node.child(2)) // &mut has an extra child
                 .ok_or("reference missing inner")?;
+
+            // Check for buffer slice: &buf[offset..] or &mut buf[offset..]
+            if inner.kind() == "index_expression" {
+                let base = inner.child(0);
+                let idx = inner.child(2);
+                if let (Some(base_node), Some(idx_node)) = (base, idx) {
+                    let base_text = ctx.text(&base_node);
+                    // Check if this is a buffer AND the index is a range expression
+                    if ctx.buf_idx(base_text).is_some() && idx_node.kind() == "range_expression" {
+                        let buf_id = ctx.buf_idx(base_text).unwrap();
+                        // Parse the start of the range
+                        let range_start = idx_node.child(0)
+                            .map(|n| parse_expr(&n, ctx))
+                            .transpose()?
+                            .unwrap_or(Expr::Const(0, ScalarType::U32));
+                        return Ok(Expr::BufSlice(buf_id, Box::new(range_start)));
+                    }
+                }
+            }
+
+            // Regular reference: just strip &
             parse_expr(&inner, ctx)
         },
         "parenthesized_expression" | "tuple_expression" => {

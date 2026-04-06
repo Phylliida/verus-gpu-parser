@@ -105,8 +105,16 @@ pub fn emit_expr(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs: &
             format!("scratch[{}]", emit_expr(offset, var_names, buf_decls, funcs))
         },
         Expr::VecIndex(var, idx) => {
-            format!("scratch[({} + {})]", var_name(var_names, *var),
+            // Check if this var has a buffer mapping (from monomorphization)
+            let vn = var_name(var_names, *var);
+            // Default to scratch; monomorphized functions override via var_name convention
+            format!("{}[({} + {})]", vn, vn,
                     emit_expr(idx, var_names, buf_decls, funcs))
+        },
+        Expr::BufSlice(buf, offset) => {
+            // Buffer slice reference — should only appear as function argument,
+            // not as a standalone expression. Emit as the offset.
+            emit_expr(offset, var_names, buf_decls, funcs)
         },
     }
 }
@@ -260,6 +268,7 @@ fn collect_arities_from_expr(e: &Expr, arities: &mut BTreeSet<usize>) {
         },
         Expr::ScratchRead(offset) => collect_arities_from_expr(offset, arities),
         Expr::VecIndex(_, idx) => collect_arities_from_expr(idx, arities),
+        Expr::BufSlice(_, offset) => collect_arities_from_expr(offset, arities),
         _ => {},
     }
 }
@@ -282,14 +291,24 @@ fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction]) -> String {
         .map(|rt| return_type_str(rt))
         .unwrap_or_else(|| "u32".to_string());
 
+    // Build monomorphized name: fn_name + buffer names for Vec params
+    let fn_display_name = if f.vec_buffer_map.is_empty() {
+        f.name.clone()
+    } else {
+        let buf_suffix: Vec<&str> = f.vec_buffer_map.iter()
+            .map(|(_, buf)| buf.as_str())
+            .collect();
+        format!("{}_{}", f.name, buf_suffix.join("_"))
+    };
+
     // Signature — Vec params become offset parameters (u32)
     let param_strs: Vec<String> = f.params.iter()
         .map(|(name, ty)| match ty {
             ParamType::Scalar(sty) => format!("{}: {}", name, scalar_type_str(sty)),
-            ParamType::VecU32 => format!("{}: u32", name), // offset into scratch
+            ParamType::VecU32 => format!("{}: u32", name), // offset into buffer
         })
         .collect();
-    s.push_str(&format!("fn {}({}) -> {} {{\n", f.name, param_strs.join(", "), ret_ty));
+    s.push_str(&format!("fn {}({}) -> {} {{\n", fn_display_name, param_strs.join(", "), ret_ty));
 
     // Declare local variables (skip params)
     let param_count = f.params.len();

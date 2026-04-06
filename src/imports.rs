@@ -201,8 +201,13 @@ fn collect_fn_sources(node: &tree_sitter::Node, source: &str, result: &mut HashM
             "function_item" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
-                    if !name.is_empty() && !name.starts_with("proof_")
-                        && !name.starts_with("lemma_") && !name.starts_with("axiom_")
+                    // Skip spec/proof/ghost functions — they don't compile to GPU code
+                    let fn_text = child.utf8_text(source.as_bytes()).unwrap_or("");
+                    let is_spec = fn_text.contains("spec fn") || fn_text.contains("proof fn")
+                        || fn_text.contains("open spec") || fn_text.contains("closed spec");
+                    if !name.is_empty() && !is_spec
+                        && !name.starts_with("proof_") && !name.starts_with("lemma_")
+                        && !name.starts_with("axiom_") && !name.starts_with("broadcast_")
                     {
                         let text = child.utf8_text(source.as_bytes()).unwrap_or("").to_string();
                         result.entry(name).or_insert(text);
