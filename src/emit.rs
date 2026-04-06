@@ -474,7 +474,7 @@ fn emit_function_single(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usiz
     let param_count = f.params.len();
     for i in param_count..f.var_names.len() {
         let vn = &f.var_names[i];
-        if vn == "_ret" || vn == "_call_tmp" || vn == "out" { continue; }
+        if vn == "_ret" || vn == "out" { continue; }
         if param_names.contains(vn.as_str()) { continue; }
         s.push_str(&format!("  var {}: u32;\n", vn));
     }
@@ -683,7 +683,7 @@ pub fn emit_kernel(k: &Kernel) -> String {
     let buf_names: Vec<&str> = k.buf_decls.iter().map(|b| b.name.as_str()).collect();
     for i in builtin_count..k.var_names.len() {
         let vn = &k.var_names[i];
-        if !buf_names.contains(&vn.as_str()) && vn != "_ret" && vn != "_call_tmp" {
+        if !buf_names.contains(&vn.as_str()) && vn != "_ret" {
             s.push_str(&format!("  var {}: u32;\n", vn));
         }
     }

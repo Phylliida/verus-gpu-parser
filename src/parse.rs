@@ -1116,6 +1116,20 @@ fn parse_expr_to_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
                         let vec_var = ctx.var_idx(&recv_name);
                         return Ok(Stmt::VecPush { vec_var, val });
                     }
+                    // .set(idx, val) → buffer write: buf[var + idx] = val
+                    if meth_name == "set" && ctx.vec_vars.contains(&recv_name) {
+                        let args = parse_call_args(node, ctx)?;
+                        let mut args_iter = args.into_iter();
+                        let idx = args_iter.next().unwrap_or(Expr::Const(0, ScalarType::U32));
+                        let val = args_iter.next().unwrap_or(Expr::Const(0, ScalarType::U32));
+                        let vec_var = ctx.var_idx(&recv_name);
+                        return Ok(Stmt::ScratchWrite {
+                            offset: Expr::BinOp(BinOp::Add,
+                                Box::new(Expr::Var(vec_var)),
+                                Box::new(idx)),
+                            val,
+                        });
+                    }
                     // .len() — skip, handled elsewhere
                     if meth_name == "len" {
                         return Ok(Stmt::Noop);
