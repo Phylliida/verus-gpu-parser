@@ -241,6 +241,26 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
     // and map each Vec param to the buffer name it's called with.
     populate_vec_buffer_maps(&final_body, &final_ctx.buf_decls, &mut functions);
 
+    // Phase 8: Propagate vec_buffer_map from recursive functions to their base_case.
+    // If generic_mul_karatsuba has buffer mappings, its base case (generic_mul_schoolbook)
+    // should inherit the same mappings since it has the same Vec signature.
+    let mut propagations: Vec<(String, Vec<(String, String)>, bool)> = Vec::new();
+    for f in &functions {
+        if let Some(ref base_name) = f.base_case {
+            if !f.vec_buffer_map.is_empty() {
+                propagations.push((base_name.clone(), f.vec_buffer_map.clone(), f.returns_vec));
+            }
+        }
+    }
+    for (base_name, map, rv) in propagations {
+        for f in &mut functions {
+            if f.name == base_name && f.vec_buffer_map.is_empty() {
+                f.vec_buffer_map = map.clone();
+                f.returns_vec = rv;
+            }
+        }
+    }
+
     let fn_name_to_id_vec: Vec<(String, u32)> = fn_id_map.into_iter().collect();
 
     Ok(Kernel {
