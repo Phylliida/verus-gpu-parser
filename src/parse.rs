@@ -241,22 +241,22 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
     // and map each Vec param to the buffer name it's called with.
     populate_vec_buffer_maps(&final_body, &final_ctx.buf_decls, &mut functions);
 
-    // Phase 8: Propagate vec_buffer_map from recursive functions to their base_case.
-    // If generic_mul_karatsuba has buffer mappings, its base case (generic_mul_schoolbook)
-    // should inherit the same mappings since it has the same Vec signature.
-    let mut propagations: Vec<(String, Vec<(String, String)>, bool)> = Vec::new();
-    for f in &functions {
-        if let Some(ref base_name) = f.base_case {
-            if !f.vec_buffer_map.is_empty() {
-                propagations.push((base_name.clone(), f.vec_buffer_map.clone(), f.returns_vec));
-            }
-        }
-    }
-    for (base_name, map, rv) in propagations {
-        for f in &mut functions {
-            if f.name == base_name && f.vec_buffer_map.is_empty() {
-                f.vec_buffer_map = map.clone();
-                f.returns_vec = rv;
+    // Phase 8: Propagate vec_buffer_map through the call chain.
+    propagate_buffer_maps(&mut functions);
+
+    // Phase 9: Any function with Vec::new() in its body needs returns_vec = true
+    // and an "out" buffer mapping. Default to the first buffer in its vec_buffer_map.
+    for f in &mut functions {
+        // Check if function creates a Vec::new() (has vec_var "out" or "out_len" in var_names)
+        let has_vec_new = f.var_names.iter().any(|v| v == "out_len");
+        if has_vec_new && !f.returns_vec {
+            f.returns_vec = true;
+            // Default output buffer = same as first input buffer, or "scratch"
+            let default_buf = f.vec_buffer_map.first()
+                .map(|(_, b)| b.clone())
+                .unwrap_or_else(|| "scratch".to_string());
+            if !f.vec_buffer_map.iter().any(|(p, _)| p == "out") {
+                f.vec_buffer_map.push(("out".to_string(), default_buf));
             }
         }
     }
@@ -274,6 +274,140 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         fn_name_to_id: fn_name_to_id_vec,
         scratch_size: 0,
     })
+}
+
+/// Propagate buffer mappings through the call chain until fixed point.
+/// When function A maps param "x" → buffer "scratch" and calls function B
+/// passing its own param "x" as B's Vec param "a", B gets "a" → "scratch".
+fn propagate_buffer_maps(functions: &mut Vec<GpuFunction>) {
+    // Build a lookup: var_name → buffer_name for each function
+    // Then walk each function's body to find calls and propagate.
+    loop {
+        let mut changed = false;
+
+        // Collect current state (to avoid borrow issues)
+        let fn_snapshots: Vec<(Vec<(String, ParamType)>, Vec<(String, String)>, bool, Option<String>)> =
+            functions.iter().map(|f| {
+                (f.params.clone(), f.vec_buffer_map.clone(), f.returns_vec, f.base_case.clone())
+            }).collect();
+
+        for caller_idx in 0..functions.len() {
+            let (ref caller_params, ref caller_buf_map, _, _) = fn_snapshots[caller_idx];
+            if caller_buf_map.is_empty() { continue; }
+
+            // Build caller's param_name → buffer_name lookup
+            let caller_lookup: HashMap<String, String> = caller_buf_map.iter().cloned().collect();
+
+            // Find all Call expressions in this function's body
+            let calls = collect_calls_from_stmt(&functions[caller_idx].body);
+
+            for (callee_fn_id, arg_exprs) in calls {
+                let callee_idx = callee_fn_id as usize;
+                if callee_idx >= functions.len() { continue; }
+
+                let (ref callee_params, ref callee_buf_map, _, _) = fn_snapshots[callee_idx];
+
+                // Match each argument to the callee's parameter
+                let callee_vec_params: Vec<&str> = callee_params.iter()
+                    .filter(|(_, ty)| matches!(ty, ParamType::VecU32))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+
+                let mut new_mappings: Vec<(String, String)> = callee_buf_map.clone();
+                let mut callee_returns_vec = fn_snapshots[callee_idx].2;
+
+                // For each argument that's a Var referencing a Vec param of the caller,
+                // propagate the buffer name to the callee's corresponding Vec param.
+                let mut vec_param_idx = 0;
+                let mut extra_buf_args = 0;
+                for arg in &arg_exprs {
+                    if let Expr::Var(var_id) = arg {
+                        let var_name_str = functions[caller_idx].var_names
+                            .get(*var_id as usize)
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Some(buf) = caller_lookup.get(&var_name_str) {
+                            if vec_param_idx < callee_vec_params.len() {
+                                let callee_param = callee_vec_params[vec_param_idx].to_string();
+                                if !new_mappings.iter().any(|(p, _)| p == &callee_param) {
+                                    new_mappings.push((callee_param, buf.clone()));
+                                    changed = true;
+                                }
+                                vec_param_idx += 1;
+                            } else {
+                                // Extra Vec arg = output buffer
+                                if !new_mappings.iter().any(|(p, _)| p == "out") {
+                                    new_mappings.push(("out".to_string(), buf.clone()));
+                                    callee_returns_vec = true;
+                                    changed = true;
+                                }
+                                extra_buf_args += 1;
+                            }
+                        }
+                    } else if let Expr::BufSlice(_, _) = arg {
+                        // Already handled by populate_vec_buffer_maps
+                        vec_param_idx += 1;
+                    }
+                }
+
+                if changed {
+                    functions[callee_idx].vec_buffer_map = new_mappings;
+                    functions[callee_idx].returns_vec = callee_returns_vec;
+                }
+            }
+
+            // Also propagate to base_case function
+            if let Some(ref base_name) = fn_snapshots[caller_idx].3 {
+                for f in functions.iter_mut() {
+                    if &f.name == base_name && f.vec_buffer_map.is_empty() {
+                        f.vec_buffer_map = caller_buf_map.clone();
+                        f.returns_vec = fn_snapshots[caller_idx].2;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if !changed { break; }
+    }
+}
+
+/// Collect all (fn_id, args) from Call expressions in a statement.
+fn collect_calls_from_stmt(s: &Stmt) -> Vec<(u32, Vec<Expr>)> {
+    let mut calls = Vec::new();
+    match s {
+        Stmt::Assign { rhs, .. } => collect_calls_from_expr(rhs, &mut calls),
+        Stmt::TupleDestructure { rhs, .. } => collect_calls_from_expr(rhs, &mut calls),
+        Stmt::CallStmt { fn_id, args, .. } => calls.push((*fn_id, args.clone())),
+        Stmt::Seq { first, then } => {
+            calls.extend(collect_calls_from_stmt(first));
+            calls.extend(collect_calls_from_stmt(then));
+        },
+        Stmt::If { then_body, else_body, .. } => {
+            calls.extend(collect_calls_from_stmt(then_body));
+            calls.extend(collect_calls_from_stmt(else_body));
+        },
+        Stmt::For { body, .. } => calls.extend(collect_calls_from_stmt(body)),
+        _ => {},
+    }
+    calls
+}
+
+fn collect_calls_from_expr(e: &Expr, calls: &mut Vec<(u32, Vec<Expr>)>) {
+    match e {
+        Expr::Call(fn_id, args) => {
+            calls.push((*fn_id, args.clone()));
+            for a in args { collect_calls_from_expr(a, calls); }
+        },
+        Expr::BinOp(_, a, b) => {
+            collect_calls_from_expr(a, calls);
+            collect_calls_from_expr(b, calls);
+        },
+        Expr::TupleConstruct(elems) => {
+            for e in elems { collect_calls_from_expr(e, calls); }
+        },
+        _ => {},
+    }
 }
 
 /// Walk a statement tree to find Call expressions with BufSlice arguments.
