@@ -33,10 +33,22 @@ impl<'a> ParseCtx<'a> {
     /// Get or create a variable index for the given name.
     /// Renames WGSL-invalid identifiers (bare `_` → `_unused_N`).
     fn var_idx(&mut self, name: &str) -> u32 {
-        // WGSL doesn't allow bare `_` as identifier
+        // WGSL reserved words and invalid identifiers
         let safe_name = if name == "_" {
             let n = self.var_names.len();
             format!("_unused_{}", n)
+        } else if name == "self" || name == "self_val" {
+            "self_val".to_string()
+        } else if matches!(name, "super" | "true" | "false" | "return" | "fn" | "let" | "var"
+            | "if" | "else" | "for" | "while" | "break" | "continue" | "switch" | "loop"
+            | "struct" | "enum" | "type" | "const" | "override" | "diagnostic" | "enable"
+            | "alias" | "bitcast" | "discard" | "fallthrough" | "default" | "case"
+            | "target" | "texture" | "sampler" | "ptr" | "ref" | "function" | "private"
+            | "workgroup" | "uniform" | "storage" | "handle" | "read" | "write" | "read_write"
+            | "array" | "atomic" | "mat2x2" | "mat3x3" | "mat4x4" | "vec2" | "vec3" | "vec4"
+            | "bool" | "f16" | "f32" | "i32" | "u32"
+        ) {
+            format!("{}_v", name)
         } else {
             name.to_string()
         };
