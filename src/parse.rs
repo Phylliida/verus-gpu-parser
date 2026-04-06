@@ -362,9 +362,21 @@ fn parse_typed_parameters(params_node: &Node, ctx: &mut ParseCtx) -> Vec<(String
     let children: Vec<Node> = params_node.children(&mut cursor).collect();
 
     for child in &children {
-        if child.kind() == "parameter" {
+        let kind = child.kind();
+        let text = ctx.text(child);
+        // Handle &self / self parameter (trait impl methods)
+        if kind == "self_parameter" || text.trim() == "&self" || text.trim() == "self"
+            || text.trim() == "&mut self"
+        {
+            let name = "self_val".to_string();
+            ctx.var_idx(&name);
+            // Also register "self" as alias for "self_val" so *self resolves
+            ctx.var_idx("self");
+            result.push((name, ParamType::Scalar(ScalarType::U32)));
+            continue;
+        }
+        if kind == "parameter" {
             let name = extract_param_name(child, ctx.source);
-            let text = ctx.text(child);
             // Detect Vec<u32> or &Vec<u32> parameters
             let param_type = if text.contains("Vec<") || text.contains("Vec <") {
                 ctx.vec_vars.insert(name.clone());
@@ -408,8 +420,19 @@ fn parse_return_type(fn_node: &Node, source: &str) -> Option<ReturnType> {
         let ty_text = after.split(|c: char| c == '{' || c == '\n')
             .next().unwrap_or("").trim();
 
-        // Check for tuple return type: (u32, u32, u32, ...)
-        if ty_text.starts_with('(') && ty_text.ends_with(')') && !ty_text.contains(':') {
+        // Strip Verus return name pattern: (name: Type) → extract Type
+        // e.g., "(out: (Self, Self))" → "(Self, Self)"
+        let ty_text = if ty_text.starts_with('(') && ty_text.contains(':') {
+            let after_colon = ty_text.split_once(':').map(|(_, t)| t.trim()).unwrap_or(ty_text);
+            // Strip exactly ONE trailing ) for the outer wrapper parens
+            after_colon.strip_suffix(')').unwrap_or(after_colon).trim()
+        } else {
+            ty_text
+        };
+
+        // Check for tuple return type: (Type, Type, ...)
+        // Also handle (Self, Self) from trait impls
+        if ty_text.starts_with('(') && ty_text.ends_with(')') {
             let inner = &ty_text[1..ty_text.len()-1];
             let types: Vec<ScalarType> = inner.split(',')
                 .map(|s| infer_scalar_type(s.trim()))
@@ -419,12 +442,6 @@ fn parse_return_type(fn_node: &Node, source: &str) -> Option<ReturnType> {
             }
         }
 
-        // Strip Verus return name pattern: (name: Type)
-        let ty_text = if ty_text.starts_with('(') && ty_text.contains(':') {
-            ty_text.split(':').last().unwrap_or("").trim().trim_end_matches(')')
-        } else {
-            ty_text
-        };
         return Some(ReturnType::Scalar(infer_scalar_type(ty_text)));
     }
     None
@@ -623,6 +640,21 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
         }
     }
     Ok(Stmt::from_vec(stmts))
+}
+
+/// Parse a block as a single expression (for if-expression-as-value).
+/// Extracts the last meaningful expression from { ... }.
+fn parse_block_as_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
+    let mut cursor = node.walk();
+    let children: Vec<Node> = node.children(&mut cursor).collect();
+    // Find the last non-brace child
+    for child in children.iter().rev() {
+        match child.kind() {
+            "{" | "}" | ";" => continue,
+            _ => return parse_expr(child, ctx),
+        }
+    }
+    Ok(Expr::Const(0, ScalarType::U32))
 }
 
 /// Parse an if expression where the result is used as a return value.
@@ -926,11 +958,13 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
         },
         "true" => Ok(Expr::Const(1, ScalarType::Bool)),
         "false" => Ok(Expr::Const(0, ScalarType::Bool)),
-        "identifier" | "scoped_identifier" => {
-            if let Some(_buf) = ctx.buf_idx(text) {
-                Ok(Expr::Var(ctx.var_idx(text)))
+        "identifier" | "scoped_identifier" | "self" => {
+            // Map "self" to "self_val" (trait impl methods)
+            let name = if text == "self" { "self_val" } else { text };
+            if let Some(_buf) = ctx.buf_idx(name) {
+                Ok(Expr::Var(ctx.var_idx(name)))
             } else {
-                Ok(Expr::Var(ctx.var_idx(text)))
+                Ok(Expr::Var(ctx.var_idx(name)))
             }
         },
         "binary_expression" => {
@@ -958,12 +992,16 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
         "unary_expression" | "prefix_unary_expression" => {
             let op_text = node.child(0).map(|n| ctx.text(&n)).unwrap_or("");
             let operand = node.child(1).ok_or("unary missing operand")?;
-            let op = match op_text {
-                "-" => UnaryOp::Neg, "!" => UnaryOp::LogicalNot,
-                "~" => UnaryOp::BitNot,
-                _ => UnaryOp::Neg,
-            };
-            Ok(Expr::UnaryOp(op, Box::new(parse_expr(&operand, ctx)?)))
+            match op_text {
+                "*" => {
+                    // Dereference: *expr → just expr (GPU has no references)
+                    parse_expr(&operand, ctx)
+                },
+                "-" => Ok(Expr::UnaryOp(UnaryOp::Neg, Box::new(parse_expr(&operand, ctx)?))),
+                "!" => Ok(Expr::UnaryOp(UnaryOp::LogicalNot, Box::new(parse_expr(&operand, ctx)?))),
+                "~" => Ok(Expr::UnaryOp(UnaryOp::BitNot, Box::new(parse_expr(&operand, ctx)?))),
+                _ => Ok(Expr::UnaryOp(UnaryOp::Neg, Box::new(parse_expr(&operand, ctx)?))),
+            }
         },
         "index_expression" => {
             let base = node.child(0).ok_or("index missing base")?;
@@ -983,6 +1021,38 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
             } else {
                 Ok(Expr::Var(ctx.var_idx(base_text)))
             }
+        },
+        "if_expression" => {
+            // if-expression as value: if cond { A } else { B } → Select(cond, A, B)
+            let cond_node = node.child_by_field_name("condition")
+                .ok_or("if-expr missing condition")?;
+            let cond = parse_expr(&cond_node, ctx)?;
+
+            let then_node = node.child_by_field_name("consequence")
+                .ok_or("if-expr missing then")?;
+            // Parse then-block: extract the single expression value
+            let then_expr = parse_block_as_expr(&then_node, ctx)?;
+
+            let else_expr = if let Some(alt) = node.child_by_field_name("alternative") {
+                if alt.kind() == "else_clause" {
+                    let mut result = Expr::Const(0, ScalarType::U32);
+                    let mut cursor = alt.walk();
+                    for child in alt.children(&mut cursor) {
+                        if child.kind() == "block" {
+                            result = parse_block_as_expr(&child, ctx)?;
+                        } else if child.kind() == "if_expression" {
+                            result = parse_expr(&child, ctx)?;
+                        }
+                    }
+                    result
+                } else {
+                    parse_block_as_expr(&alt, ctx)?
+                }
+            } else {
+                Expr::Const(0, ScalarType::U32)
+            };
+
+            Ok(Expr::Select(Box::new(cond), Box::new(then_expr), Box::new(else_expr)))
         },
         "reference_expression" | "borrow_expression" => {
             // &expr or &mut expr → just strip the & and parse inner
