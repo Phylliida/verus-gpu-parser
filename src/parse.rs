@@ -357,22 +357,42 @@ fn find_gpu_kernel_fn<'a>(node: &Node<'a>, source: &str) -> Option<Node<'a>> {
 }
 
 /// Extract workgroup_size(X, Y, Z) from #[gpu_kernel(...)] attribute.
+/// Checks both the function node text AND preceding sibling nodes (attribute_item).
 fn parse_workgroup_size(fn_node: &Node, source: &str) -> (u32, u32, u32) {
+    // First check the function node itself (in case attribute is embedded)
     let text = fn_node.utf8_text(source.as_bytes()).unwrap_or("");
+    if let Some(result) = extract_workgroup_size(text) {
+        return result;
+    }
+    // Check preceding siblings (attribute_item nodes before the function)
+    if let Some(parent) = fn_node.parent() {
+        let mut cursor = parent.walk();
+        for child in parent.children(&mut cursor) {
+            if child.id() == fn_node.id() { break; }
+            let child_text = child.utf8_text(source.as_bytes()).unwrap_or("");
+            if let Some(result) = extract_workgroup_size(child_text) {
+                return result;
+            }
+        }
+    }
+    (256, 1, 1)
+}
+
+fn extract_workgroup_size(text: &str) -> Option<(u32, u32, u32)> {
     if let Some(start) = text.find("workgroup_size(") {
         let rest = &text[start + "workgroup_size(".len()..];
         if let Some(end) = rest.find(')') {
             let nums: Vec<u32> = rest[..end].split(',')
                 .filter_map(|s| s.trim().parse().ok())
                 .collect();
-            return (
+            return Some((
                 nums.first().copied().unwrap_or(1),
                 nums.get(1).copied().unwrap_or(1),
                 nums.get(2).copied().unwrap_or(1),
-            );
+            ));
         }
     }
-    (256, 1, 1)
+    None
 }
 
 /// Parse function parameters — identify builtins (#[gpu_builtin]) and buffers (#[gpu_buffer]).
