@@ -194,6 +194,16 @@ pub fn emit_kernel(k: &Kernel) -> String {
         s.push_str(&format!("  let {} = {};\n", var_name(&k.var_names, i as u32), bn));
     }
 
+    // Declare local variables (skip builtins and buffer names)
+    let builtin_count = k.builtin_names.len();
+    let buf_names: Vec<&str> = k.buf_decls.iter().map(|b| b.name.as_str()).collect();
+    for i in builtin_count..k.var_names.len() {
+        let vn = &k.var_names[i];
+        if !buf_names.contains(&vn.as_str()) && vn != "__ret" && vn != "__call_tmp" {
+            s.push_str(&format!("  var {}: u32;\n", vn));
+        }
+    }
+
     // Body
     s.push_str(&emit_stmt(&k.body, &k.var_names, &k.buf_decls, &k.functions, 1));
     s.push_str("}\n");

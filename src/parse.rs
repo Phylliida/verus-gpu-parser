@@ -419,24 +419,44 @@ fn extract_param_name(param_node: &Node, source: &str) -> String {
 }
 
 /// Parse a block (surrounded by braces) into a Stmt.
+/// The last expression without a semicolon is treated as implicit return (__ret = expr).
 fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
     let mut stmts = Vec::new();
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
+    let children: Vec<Node> = node.children(&mut cursor).collect();
+
+    // Find the last non-brace child to detect implicit return
+    let last_meaningful = children.iter().rev()
+        .find(|c| c.kind() != "}" && c.kind() != "{")
+        .map(|c| c.id());
+
+    for child in &children {
         let kind = child.kind();
+        let is_last = Some(child.id()) == last_meaningful;
         match kind {
             "{" | "}" => {},
-            "let_declaration" => stmts.push(parse_let(&child, ctx)?),
-            "expression_statement" => stmts.push(parse_expr_stmt(&child, ctx)?),
-            "if_expression" => stmts.push(parse_if(&child, ctx)?),
-            "for_expression" => stmts.push(parse_for(&child, ctx)?),
+            "let_declaration" => stmts.push(parse_let(child, ctx)?),
+            "expression_statement" => stmts.push(parse_expr_stmt(child, ctx)?),
+            "if_expression" => {
+                if is_last {
+                    // Last if-expression: treat as implicit return value
+                    let if_stmt = parse_if_as_return(child, ctx)?;
+                    stmts.push(if_stmt);
+                } else {
+                    stmts.push(parse_if(child, ctx)?);
+                }
+            },
+            "for_expression" => stmts.push(parse_for(child, ctx)?),
             "return_expression" => {
                 // return expr → assign to __ret + Return
-                if let Some(val) = child.child(1) {
-                    if val.kind() != ";" {
-                        let rhs = parse_expr(&val, ctx)?;
+                let mut cursor2 = child.walk();
+                let ret_children: Vec<Node> = child.children(&mut cursor2).collect();
+                for rc in &ret_children {
+                    if rc.kind() != "return" && rc.kind() != ";" {
+                        let rhs = parse_expr(rc, ctx)?;
                         let ret_var = ctx.var_idx("__ret");
                         stmts.push(Stmt::Assign { var: ret_var, rhs });
+                        break;
                     }
                 }
                 stmts.push(Stmt::Return);
@@ -449,13 +469,56 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
             // Skip proof blocks and ghost code
             "proof_block" | "ghost_block" => {},
             _ => {
-                if let Ok(s) = parse_expr_to_stmt(&child, ctx) {
+                // Check if this is a bare expression (implicit return) at end of block
+                if is_last && kind != "expression_statement" {
+                    // Bare expression without ; → implicit return
+                    if let Ok(expr) = parse_expr(child, ctx) {
+                        let ret_var = ctx.var_idx("__ret");
+                        stmts.push(Stmt::Assign { var: ret_var, rhs: expr });
+                    } else if let Ok(s) = parse_expr_to_stmt(child, ctx) {
+                        stmts.push(s);
+                    }
+                } else if let Ok(s) = parse_expr_to_stmt(child, ctx) {
                     stmts.push(s);
                 }
             },
         }
     }
     Ok(Stmt::from_vec(stmts))
+}
+
+/// Parse an if expression where the result is used as a return value.
+/// Each branch's last expression gets assigned to __ret.
+fn parse_if_as_return(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
+    let cond_node = node.child_by_field_name("condition")
+        .ok_or("if missing condition")?;
+    let cond = parse_expr(&cond_node, ctx)?;
+
+    let then_node = node.child_by_field_name("consequence")
+        .ok_or("if missing then body")?;
+    // Parse then-block with implicit return handling (parse_block handles it)
+    let then_body = parse_block(&then_node, ctx)?;
+
+    let else_body = if let Some(alt) = node.child_by_field_name("alternative") {
+        if alt.kind() == "else_clause" {
+            let mut cursor = alt.walk();
+            let mut result = Stmt::Noop;
+            for child in alt.children(&mut cursor) {
+                if child.kind() == "block" {
+                    result = parse_block(&child, ctx)?;
+                } else if child.kind() == "if_expression" {
+                    result = parse_if_as_return(&child, ctx)?;
+                }
+            }
+            result
+        } else {
+            parse_block(&alt, ctx)?
+        }
+    } else {
+        Stmt::Noop
+    };
+
+    Ok(Stmt::If { cond, then_body: Box::new(then_body), else_body: Box::new(else_body) })
 }
 
 fn parse_let(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
