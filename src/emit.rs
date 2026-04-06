@@ -123,11 +123,14 @@ pub fn emit_stmt(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
                     name, arg_strs.join(", "))
         },
         Stmt::TupleDestructure { vars, rhs } => {
-            // let (a, b, c) = expr; → var __tmp = expr; a = __tmp._0; b = __tmp._1; ...
-            let mut s = format!("{}var __td = {};\n", pad, emit_expr(rhs, var_names, buf_decls, funcs));
+            // let (a, b, c) = expr; → { var __td = expr; a = __td._0; b = __td._1; ... }
+            // Use a block scope so __td doesn't conflict with other destructures.
+            let mut s = format!("{}{{\n", pad);
+            s.push_str(&format!("{}  var __td = {};\n", pad, emit_expr(rhs, var_names, buf_decls, funcs)));
             for (i, var) in vars.iter().enumerate() {
-                s.push_str(&format!("{}{} = __td._{};\n", pad, var_name(var_names, *var), i));
+                s.push_str(&format!("{}  {} = __td._{};\n", pad, var_name(var_names, *var), i));
             }
+            s.push_str(&format!("{}}}\n", pad));
             s
         },
         Stmt::Seq { first, then } => {

@@ -5,6 +5,7 @@
 mod types;
 mod emit;
 mod parse;
+mod imports;
 
 use std::fs;
 
@@ -26,7 +27,7 @@ fn main() {
             std::process::exit(1);
         });
 
-    let kernel = match parse::parse_gpu_kernel(&source) {
+    let kernel = match parse::parse_gpu_kernel(&source, input_path) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("Parse error: {}", e);

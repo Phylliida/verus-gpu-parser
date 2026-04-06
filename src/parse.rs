@@ -9,6 +9,7 @@
 use tree_sitter::Node;
 use crate::types::*;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 /// Parser state: source text + variable/buffer name tracking.
 struct ParseCtx<'a> {
@@ -54,7 +55,8 @@ impl<'a> ParseCtx<'a> {
 }
 
 /// Parse a complete #[gpu_kernel] function + reachable helpers from source.
-pub fn parse_gpu_kernel(source: &str) -> Result<Kernel, String> {
+/// `file_path` is used to resolve `use` imports relative to the file's crate.
+pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_verus::LANGUAGE.into())
         .map_err(|e| format!("Failed to load Verus grammar: {}", e))?;
@@ -64,7 +66,11 @@ pub fn parse_gpu_kernel(source: &str) -> Result<Kernel, String> {
 
     let root = tree.root_node();
 
-    // Phase 1: Find all function_item nodes in the file
+    // Phase 0: Resolve `use` imports → find external function source texts
+    let imported_fn_sources = crate::imports::resolve_all_imports(source, file_path);
+    eprintln!("Resolved {} imported functions", imported_fn_sources.len());
+
+    // Phase 1: Find all function_item nodes in the local file
     let all_fns = find_all_functions(&root, source);
 
     // Phase 2: Find the #[gpu_kernel] function
@@ -97,40 +103,51 @@ pub fn parse_gpu_kernel(source: &str) -> Result<Kernel, String> {
         Stmt::Noop
     };
 
-    // Phase 4: Reachability walk — find all transitively called functions
+    // Phase 4: Reachability walk — find all transitively called functions.
+    // Checks both local file functions AND imported function sources.
     let mut reachable: Vec<String> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<String> = ctx.called_fns.iter().cloned().collect();
 
     while let Some(fn_name) = queue.pop_front() {
         if visited.contains(&fn_name) { continue; }
-        if !all_fns.contains_key(&fn_name) { continue; } // external/unknown
+
+        // Check if function exists locally or in imports
+        let is_local = all_fns.contains_key(&fn_name);
+        let is_imported = imported_fn_sources.contains_key(&fn_name);
+        if !is_local && !is_imported { continue; }
+
         visited.insert(fn_name.clone());
         reachable.push(fn_name.clone());
 
         // Parse this function to discover ITS callees
-        let fn_node = &all_fns[&fn_name];
-        let mut helper_ctx = ParseCtx {
-            source,
-            var_names: Vec::new(),
-            buf_decls: Vec::new(), // helpers don't have buffers
-            builtin_names: Vec::new(),
-            fn_name_to_id: ctx.fn_name_to_id.clone(),
-            called_fns: HashSet::new(),
+        let callees = if is_local {
+            let fn_node = &all_fns[&fn_name];
+            let mut helper_ctx = ParseCtx {
+                source,
+                var_names: Vec::new(),
+                buf_decls: Vec::new(),
+                builtin_names: Vec::new(),
+                fn_name_to_id: ctx.fn_name_to_id.clone(),
+                called_fns: HashSet::new(),
+            };
+            if let Some(params) = fn_node.child_by_field_name("parameters") {
+                parse_helper_parameters(&params, &mut helper_ctx);
+            }
+            if let Some(body_node) = fn_node.child_by_field_name("body") {
+                let _ = parse_block(&body_node, &mut helper_ctx);
+            }
+            for (k, v) in &helper_ctx.fn_name_to_id {
+                ctx.fn_name_to_id.entry(k.clone()).or_insert(*v);
+            }
+            helper_ctx.called_fns
+        } else {
+            // Imported function: parse from stored source text
+            let fn_src = &imported_fn_sources[&fn_name];
+            discover_callees_from_source(fn_src, &mut parser, &mut ctx)
         };
-        // Parse helper params as regular variables
-        if let Some(params) = fn_node.child_by_field_name("parameters") {
-            parse_helper_parameters(&params, &mut helper_ctx);
-        }
-        if let Some(body_node) = fn_node.child_by_field_name("body") {
-            let _ = parse_block(&body_node, &mut helper_ctx);
-        }
-        // Merge fn_name_to_id back (new functions may have been discovered)
-        for (k, v) in &helper_ctx.fn_name_to_id {
-            ctx.fn_name_to_id.entry(k.clone()).or_insert(*v);
-        }
-        // Enqueue newly discovered callees
-        for callee in &helper_ctx.called_fns {
+
+        for callee in &callees {
             if !visited.contains(callee) {
                 queue.push_back(callee.clone());
             }
@@ -138,7 +155,6 @@ pub fn parse_gpu_kernel(source: &str) -> Result<Kernel, String> {
     }
 
     // Phase 5: Parse reachable functions into GpuFunction structs
-    // Assign stable fn_ids based on order discovered
     let mut fn_id_map: HashMap<String, u32> = HashMap::new();
     let mut functions: Vec<GpuFunction> = Vec::new();
 
@@ -147,9 +163,14 @@ pub fn parse_gpu_kernel(source: &str) -> Result<Kernel, String> {
     }
 
     for fn_name in &reachable {
-        let fn_node = &all_fns[fn_name];
-        let func = parse_helper_function(fn_node, source, &fn_id_map)?;
-        functions.push(func);
+        if all_fns.contains_key(fn_name) {
+            let fn_node = &all_fns[fn_name];
+            let func = parse_helper_function(fn_node, source, &fn_id_map)?;
+            functions.push(func);
+        } else if let Some(fn_src) = imported_fn_sources.get(fn_name) {
+            let func = parse_helper_function_from_source(fn_src, &mut parser, &fn_id_map)?;
+            functions.push(func);
+        }
     }
 
     // Phase 6: Re-parse kernel body with final fn_id_map so CallStmt/Call IDs are correct
@@ -184,6 +205,66 @@ pub fn parse_gpu_kernel(source: &str) -> Result<Kernel, String> {
         functions,
         fn_name_to_id: fn_name_to_id_vec,
     })
+}
+
+/// Discover callees from a function's source text (for imported functions).
+fn discover_callees_from_source(
+    fn_source: &str, parser: &mut tree_sitter::Parser, parent_ctx: &mut ParseCtx,
+) -> HashSet<String> {
+    let tree = match parser.parse(fn_source.as_bytes(), None) {
+        Some(t) => t,
+        None => return HashSet::new(),
+    };
+    let root = tree.root_node();
+    // Find the function_item inside
+    let fn_node = match find_first_function(&root) {
+        Some(n) => n,
+        None => return HashSet::new(),
+    };
+    let mut helper_ctx = ParseCtx {
+        source: fn_source,
+        var_names: Vec::new(),
+        buf_decls: Vec::new(),
+        builtin_names: Vec::new(),
+        fn_name_to_id: parent_ctx.fn_name_to_id.clone(),
+        called_fns: HashSet::new(),
+    };
+    if let Some(params) = fn_node.child_by_field_name("parameters") {
+        parse_helper_parameters(&params, &mut helper_ctx);
+    }
+    if let Some(body_node) = fn_node.child_by_field_name("body") {
+        let _ = parse_block(&body_node, &mut helper_ctx);
+    }
+    for (k, v) in &helper_ctx.fn_name_to_id {
+        parent_ctx.fn_name_to_id.entry(k.clone()).or_insert(*v);
+    }
+    helper_ctx.called_fns
+}
+
+/// Parse a helper function from its standalone source text.
+fn parse_helper_function_from_source(
+    fn_source: &str, parser: &mut tree_sitter::Parser, fn_id_map: &HashMap<String, u32>,
+) -> Result<GpuFunction, String> {
+    let tree = parser.parse(fn_source.as_bytes(), None)
+        .ok_or("Failed to parse imported function")?;
+    let root = tree.root_node();
+    let fn_node = find_first_function(&root)
+        .ok_or("No function_item found in imported source")?;
+    parse_helper_function(&fn_node, fn_source, fn_id_map)
+}
+
+/// Find the first function_item in a tree.
+fn find_first_function<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "function_item" {
+            return Some(child);
+        }
+        if let Some(f) = find_first_function(&child) {
+            return Some(f);
+        }
+    }
+    None
 }
 
 /// Find all function_item nodes in the file, keyed by name.
@@ -882,10 +963,46 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
             Ok(Expr::Cast(ty, Box::new(parse_expr(&inner, ctx)?)))
         },
         "call_expression" => {
-            // Function call as expression: f(args) → Call(fn_id, args)
             let func = node.child_by_field_name("function")
                 .ok_or("call missing function")?;
-            let func_name = ctx.text(&func).to_string();
+            let func_text = ctx.text(&func).to_string();
+
+            // Handle method calls: x.wrapping_add(y) → x + y, x.wrapping_sub(y) → x - y, etc.
+            if func.kind() == "field_expression" {
+                let receiver = func.child(0).ok_or("method call missing receiver")?;
+                let method = func.child(2)
+                    .or_else(|| func.child_by_field_name("field"))
+                    .ok_or("method call missing method name")?;
+                let method_name = ctx.text(&method);
+                let args = parse_call_args(node, ctx)?;
+                let receiver_expr = parse_expr(&receiver, ctx)?;
+
+                return match method_name {
+                    "wrapping_add" => {
+                        let rhs = args.into_iter().next().ok_or("wrapping_add needs arg")?;
+                        Ok(Expr::BinOp(BinOp::WrappingAdd, Box::new(receiver_expr), Box::new(rhs)))
+                    },
+                    "wrapping_sub" => {
+                        let rhs = args.into_iter().next().ok_or("wrapping_sub needs arg")?;
+                        Ok(Expr::BinOp(BinOp::WrappingSub, Box::new(receiver_expr), Box::new(rhs)))
+                    },
+                    "wrapping_mul" => {
+                        let rhs = args.into_iter().next().ok_or("wrapping_mul needs arg")?;
+                        Ok(Expr::BinOp(BinOp::WrappingMul, Box::new(receiver_expr), Box::new(rhs)))
+                    },
+                    _ => {
+                        // Unknown method — treat as function call
+                        let fn_id = ctx.fn_id(&func_text);
+                        ctx.called_fns.insert(func_text);
+                        let mut all_args = vec![receiver_expr];
+                        all_args.extend(args);
+                        Ok(Expr::Call(fn_id, all_args))
+                    },
+                };
+            }
+
+            // Regular function call
+            let func_name = func_text;
             let args = parse_call_args(node, ctx)?;
             let fn_id = ctx.fn_id(&func_name);
             ctx.called_fns.insert(func_name);
