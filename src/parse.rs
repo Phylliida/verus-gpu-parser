@@ -683,9 +683,23 @@ fn parse_let(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
     }
 
     let name = pattern_text.strip_prefix("mut ").unwrap_or(&pattern_text).trim().to_string();
+
+    // Check for Vec::new() — marks variable as vec-typed
+    let rhs_node = node.child_by_field_name("value");
+    let rhs_text = rhs_node.map(|n| ctx.text(&n).to_string()).unwrap_or_default();
+    if rhs_text.contains("Vec::new()") || rhs_text.contains("Vec::<") {
+        ctx.vec_vars.insert(name.clone());
+        let var = ctx.var_idx(&name);
+        // Vec::new() → the variable IS the scratch offset (set by caller).
+        // Also create a length tracker: name_len = 0
+        let len_name = format!("{}_len", name);
+        let len_var = ctx.var_idx(&len_name);
+        return Ok(Stmt::Assign { var: len_var, rhs: Expr::Const(0, ScalarType::U32) });
+    }
+
     let var = ctx.var_idx(&name);
 
-    let rhs = if let Some(val) = node.child_by_field_name("value") {
+    let rhs = if let Some(val) = rhs_node {
         parse_expr(&val, ctx)?
     } else {
         Expr::Const(0, ScalarType::I32)
@@ -752,6 +766,32 @@ fn parse_expr_to_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
         let var = ctx.var_idx(lhs_text);
         let rhs = parse_expr(&rhs_node, ctx)?;
         return Ok(Stmt::Assign { var, rhs });
+    }
+
+    // Method call as statement: check for .push() on vec vars
+    if node.kind() == "call_expression" {
+        let func = node.child_by_field_name("function");
+        if let Some(func_node) = func {
+            if func_node.kind() == "field_expression" {
+                let receiver = func_node.child(0);
+                let method = func_node.child(2)
+                    .or_else(|| func_node.child_by_field_name("field"));
+                if let (Some(recv), Some(meth)) = (receiver, method) {
+                    let recv_name = ctx.text(&recv).to_string();
+                    let meth_name = ctx.text(&meth);
+                    if meth_name == "push" && ctx.vec_vars.contains(&recv_name) {
+                        let args = parse_call_args(node, ctx)?;
+                        let val = args.into_iter().next().unwrap_or(Expr::Const(0, ScalarType::U32));
+                        let vec_var = ctx.var_idx(&recv_name);
+                        return Ok(Stmt::VecPush { vec_var, val });
+                    }
+                    // .len() — skip, handled elsewhere
+                    if meth_name == "len" {
+                        return Ok(Stmt::Noop);
+                    }
+                }
+            }
+        }
     }
 
     // Function call as statement: f(args) → CallStmt with result discarded
@@ -933,9 +973,23 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
                     .ok_or("index missing index expr")?;
                 let idx = parse_expr(&idx_node, ctx)?;
                 Ok(Expr::ArrayRead(buf, Box::new(idx)))
+            } else if ctx.vec_vars.contains(base_text) {
+                // Vec indexing: a[i] → scratch[a_off + i]
+                let var = ctx.var_idx(base_text);
+                let idx_node = node.child(2)
+                    .ok_or("vec index missing index expr")?;
+                let idx = parse_expr(&idx_node, ctx)?;
+                Ok(Expr::VecIndex(var, Box::new(idx)))
             } else {
                 Ok(Expr::Var(ctx.var_idx(base_text)))
             }
+        },
+        "reference_expression" | "borrow_expression" => {
+            // &expr or &mut expr → just strip the & and parse inner
+            let inner = node.child(1)
+                .or_else(|| node.child(2)) // &mut has an extra child
+                .ok_or("reference missing inner")?;
+            parse_expr(&inner, ctx)
         },
         "parenthesized_expression" | "tuple_expression" => {
             // Could be (expr) or (a, b, c, ...)
