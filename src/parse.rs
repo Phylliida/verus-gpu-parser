@@ -480,16 +480,18 @@ fn parse_typed_parameters(params_node: &Node, ctx: &mut ParseCtx) -> Vec<(String
             continue;
         }
         if kind == "parameter" {
-            let name = extract_param_name(child, ctx.source);
+            let raw_name = extract_param_name(child, ctx.source);
             // Detect Vec<u32> or &Vec<u32> parameters
             let param_type = if text.contains("Vec<") || text.contains("Vec <") {
-                ctx.vec_vars.insert(name.clone());
+                ctx.vec_vars.insert(raw_name.clone());
                 ParamType::VecU32
             } else {
                 ParamType::Scalar(infer_scalar_type(text))
             };
-            ctx.var_idx(&name);
-            result.push((name, param_type));
+            let idx = ctx.var_idx(&raw_name);
+            // Use the sanitized name from var_names (handles reserved words)
+            let safe_name = ctx.var_names[idx as usize].clone();
+            result.push((safe_name, param_type));
         }
     }
     result
