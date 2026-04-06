@@ -194,14 +194,26 @@ pub fn extract_functions_from_file(file_path: &Path) -> HashMap<String, String> 
 }
 
 /// Walk a tree-sitter tree and collect function source texts.
+/// Includes preceding attribute nodes (e.g., #[gpu_base_case(...)]).
 fn collect_fn_sources(node: &tree_sitter::Node, source: &str, result: &mut HashMap<String, String>) {
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
+    let children: Vec<tree_sitter::Node> = node.children(&mut cursor).collect();
+    let mut prev_attr: Option<String> = None;
+
+    for child in &children {
+        let kind = child.kind();
+        // Track attribute items that might precede a function
+        if kind == "attribute_item" {
+            let attr_text = child.utf8_text(source.as_bytes()).unwrap_or("");
+            if attr_text.contains("gpu_base_case") {
+                prev_attr = Some(attr_text.to_string());
+            }
+            continue;
+        }
+        match kind {
             "function_item" => {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
-                    // Skip spec/proof/ghost functions — they don't compile to GPU code
                     let fn_text = child.utf8_text(source.as_bytes()).unwrap_or("");
                     let is_spec = fn_text.contains("spec fn") || fn_text.contains("proof fn")
                         || fn_text.contains("open spec") || fn_text.contains("closed spec");
@@ -209,12 +221,21 @@ fn collect_fn_sources(node: &tree_sitter::Node, source: &str, result: &mut HashM
                         && !name.starts_with("proof_") && !name.starts_with("lemma_")
                         && !name.starts_with("axiom_") && !name.starts_with("broadcast_")
                     {
-                        let text = child.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                        // Prepend attribute if present
+                        let text = if let Some(ref attr) = prev_attr {
+                            format!("{}\n{}", attr, fn_text)
+                        } else {
+                            fn_text.to_string()
+                        };
                         result.entry(name).or_insert(text);
                     }
                 }
+                prev_attr = None;
             },
-            _ => collect_fn_sources(&child, source, result),
+            _ => {
+                collect_fn_sources(child, source, result);
+                prev_attr = None;
+            },
         }
     }
 }

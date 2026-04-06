@@ -119,6 +119,9 @@ pub struct GpuFunction {
     pub var_names: Vec<String>,
     pub body: Stmt,
     pub ret_var: u32,
+    /// Base case function for recursion unrolling. Parsed from #[gpu_base_case(name)].
+    /// At depth 0, self-calls are replaced with this function.
+    pub base_case: Option<String>,
 }
 
 #[derive(Debug, Clone)]

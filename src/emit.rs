@@ -382,9 +382,8 @@ fn emit_function(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usize) -> S
 fn emit_recursive_unrolled(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usize) -> String {
     let mut s = String::new();
 
-    // Find the base case function: look for #[gpu_base_case(name)] in the source,
-    // or find the first non-self function called in the body.
-    let base_case_name = find_base_case_fn(f, all_funcs, fn_idx);
+    // Use the annotated #[gpu_base_case(name)] from the function
+    let base_case_name = f.base_case.clone();
 
     // Emit depth 0 through MAX_RECURSION_DEPTH
     for depth in 0..=MAX_RECURSION_DEPTH {

@@ -176,6 +176,24 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
                 queue.push_back(callee.clone());
             }
         }
+
+        // Also discover #[gpu_base_case(name)] annotation on this function
+        let fn_src_text = if is_local {
+            all_fns.get(&fn_name).map(|n| n.utf8_text(source.as_bytes()).unwrap_or(""))
+        } else {
+            imported_fn_sources.get(&fn_name).map(|s| s.as_str())
+        };
+        if let Some(text) = fn_src_text {
+            if let Some(start) = text.find("gpu_base_case(") {
+                let rest = &text[start + "gpu_base_case(".len()..];
+                if let Some(end) = rest.find(')') {
+                    let base = rest[..end].trim().to_string();
+                    if !visited.contains(&base) {
+                        queue.push_back(base);
+                    }
+                }
+            }
+        }
     }
 
     // Phase 5: Parse reachable functions into GpuFunction structs
@@ -419,6 +437,20 @@ fn parse_helper_function(
         .map(|n| n.utf8_text(source.as_bytes()).unwrap_or("f").to_string())
         .unwrap_or_else(|| "f".to_string());
 
+    // Check for #[gpu_base_case(name)] attribute.
+    // Search in both the node text AND the source text preceding the function
+    // (the attribute may be a preceding sibling not included in the function_item node).
+    let fn_text = fn_node.utf8_text(source.as_bytes()).unwrap_or("");
+    let fn_start = fn_node.start_byte();
+    // Look at up to 200 bytes before the function start for preceding attributes
+    let prefix_start = if fn_start > 200 { fn_start - 200 } else { 0 };
+    let search_text = &source[prefix_start..fn_start.min(source.len())];
+    let combined = format!("{}\n{}", search_text, fn_text);
+    let base_case = if let Some(start) = combined.find("gpu_base_case(") {
+        let rest = &combined[start + "gpu_base_case(".len()..];
+        rest.find(')').map(|end| rest[..end].trim().to_string())
+    } else { None };
+
     // Parse parameters as regular typed variables
     let mut params = Vec::new();
     if let Some(params_node) = fn_node.child_by_field_name("parameters") {
@@ -456,6 +488,7 @@ fn parse_helper_function(
         var_names: ctx.var_names,
         body,
         ret_var,
+        base_case,
     })
 }
 
