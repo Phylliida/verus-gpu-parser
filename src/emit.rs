@@ -120,7 +120,7 @@ fn emit_expr_ctx(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs: &
             format!("{}({})", tuple_struct_name(arity), elem_strs.join(", "))
         },
         Expr::TupleAccess(base, idx) => {
-            format!("{}._{}", emit_expr_ctx(base, var_names, buf_decls, funcs, vec_buf_map), idx)
+            format!("{}.f{}", emit_expr_ctx(base, var_names, buf_decls, funcs, vec_buf_map), idx)
         },
         Expr::ScratchRead(offset) => {
             format!("scratch[{}]", emit_expr_ctx(offset, var_names, buf_decls, funcs, vec_buf_map))
@@ -182,12 +182,12 @@ fn emit_stmt_ctx(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
                     name, arg_strs.join(", "))
         },
         Stmt::TupleDestructure { vars, rhs } => {
-            // let (a, b, c) = expr; → { var _td = expr; a = _td._0; b = _td._1; ... }
+            // let (a, b, c) = expr; → { var _td = expr; a = _td.f0; b = _td.f1; ... }
             // Use a block scope so _td doesn't conflict with other destructures.
             let mut s = format!("{}{{\n", pad);
             s.push_str(&format!("{}  var _td = {};\n", pad, emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map)));
             for (i, var) in vars.iter().enumerate() {
-                s.push_str(&format!("{}  {} = _td._{};\n", pad, var_name(var_names, *var), i));
+                s.push_str(&format!("{}  {} = _td.f{};\n", pad, var_name(var_names, *var), i));
             }
             s.push_str(&format!("{}}}\n", pad));
             s
@@ -325,7 +325,7 @@ fn collect_arities_from_expr(e: &Expr, arities: &mut BTreeSet<usize>) {
 fn emit_tuple_struct(arity: usize) -> String {
     let mut s = format!("struct {} {{\n", tuple_struct_name(arity));
     for i in 0..arity {
-        s.push_str(&format!("  _{}: u32,\n", i));
+        s.push_str(&format!("  f{}: u32,\n", i));
     }
     s.push_str("}\n\n");
     s
@@ -542,7 +542,7 @@ fn emit_stmt_depth(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs:
             s.push_str(&format!("{}  var _td = {};\n", pad,
                 emit_expr_depth(rhs, var_names, buf_decls, funcs, vec_buf_map, rec)));
             for (i, var) in vars.iter().enumerate() {
-                s.push_str(&format!("{}  {} = _td._{};\n", pad, var_name(var_names, *var), i));
+                s.push_str(&format!("{}  {} = _td.f{};\n", pad, var_name(var_names, *var), i));
             }
             s.push_str(&format!("{}}}\n", pad));
             s
