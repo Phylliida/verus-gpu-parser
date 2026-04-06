@@ -152,15 +152,15 @@ fn emit_stmt_ctx(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
     match s {
         Stmt::Assign { var, rhs } => {
             let vn = var_name(var_names, *var);
-            // When assigning to __ret and rhs is a tuple with a Vec element,
+            // When assigning to _ret and rhs is a tuple with a Vec element,
             // and we have an output buffer, extract just the scalar part.
-            if vn == "__ret" {
+            if vn == "_ret" {
                 if let Expr::TupleConstruct(elems) = rhs {
                     // Check if any element is a Vec var (mapped to buffer)
                     let has_output_vec = !vec_buf_map.is_empty() &&
                         vec_buf_map.iter().any(|(name, _)| name == "out");
                     if has_output_vec && elems.len() == 2 {
-                        // (out_vec, scalar) → just assign scalar to __ret
+                        // (out_vec, scalar) → just assign scalar to _ret
                         return format!("{}{} = {};\n", pad, vn,
                             emit_expr_ctx(&elems[1], var_names, buf_decls, funcs, vec_buf_map));
                     }
@@ -182,12 +182,12 @@ fn emit_stmt_ctx(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
                     name, arg_strs.join(", "))
         },
         Stmt::TupleDestructure { vars, rhs } => {
-            // let (a, b, c) = expr; → { var __td = expr; a = __td._0; b = __td._1; ... }
-            // Use a block scope so __td doesn't conflict with other destructures.
+            // let (a, b, c) = expr; → { var _td = expr; a = _td._0; b = _td._1; ... }
+            // Use a block scope so _td doesn't conflict with other destructures.
             let mut s = format!("{}{{\n", pad);
-            s.push_str(&format!("{}  var __td = {};\n", pad, emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map)));
+            s.push_str(&format!("{}  var _td = {};\n", pad, emit_expr_ctx(rhs, var_names, buf_decls, funcs, vec_buf_map)));
             for (i, var) in vars.iter().enumerate() {
-                s.push_str(&format!("{}  {} = __td._{};\n", pad, var_name(var_names, *var), i));
+                s.push_str(&format!("{}  {} = _td._{};\n", pad, var_name(var_names, *var), i));
             }
             s.push_str(&format!("{}}}\n", pad));
             s
@@ -433,10 +433,10 @@ fn emit_function_single(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usiz
     let param_count = f.params.len();
     for i in param_count..f.var_names.len() {
         let vn = &f.var_names[i];
-        if vn == "__ret" || vn == "__call_tmp" || vn == "out" { continue; }
+        if vn == "_ret" || vn == "_call_tmp" || vn == "out" { continue; }
         s.push_str(&format!("  var {}: u32;\n", vn));
     }
-    s.push_str(&format!("  var __ret: {};\n", ret_ty));
+    s.push_str(&format!("  var _ret: {};\n", ret_ty));
 
     // Body — emit with depth-aware call replacement
     let empty_bufs: Vec<BufDecl> = Vec::new();
@@ -448,7 +448,7 @@ fn emit_function_single(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usiz
     s.push_str(&emit_stmt_depth(&f.body, &f.var_names, &empty_bufs, all_funcs, 1,
                                  &f.vec_buffer_map, &recursion_ctx));
 
-    s.push_str("  return __ret;\n");
+    s.push_str("  return _ret;\n");
     s.push_str("}\n\n");
     s
 }
@@ -467,7 +467,7 @@ fn emit_stmt_depth(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs:
     match s {
         Stmt::Assign { var, rhs } => {
             let vn = var_name(var_names, *var);
-            if vn == "__ret" {
+            if vn == "_ret" {
                 if let Expr::TupleConstruct(elems) = rhs {
                     let has_output_vec = !vec_buf_map.is_empty() &&
                         vec_buf_map.iter().any(|(name, _)| name == "out");
@@ -494,10 +494,10 @@ fn emit_stmt_depth(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs:
         },
         Stmt::TupleDestructure { vars, rhs } => {
             let mut s = format!("{}{{\n", pad);
-            s.push_str(&format!("{}  var __td = {};\n", pad,
+            s.push_str(&format!("{}  var _td = {};\n", pad,
                 emit_expr_depth(rhs, var_names, buf_decls, funcs, vec_buf_map, rec)));
             for (i, var) in vars.iter().enumerate() {
-                s.push_str(&format!("{}  {} = __td._{};\n", pad, var_name(var_names, *var), i));
+                s.push_str(&format!("{}  {} = _td._{};\n", pad, var_name(var_names, *var), i));
             }
             s.push_str(&format!("{}}}\n", pad));
             s
@@ -632,7 +632,7 @@ pub fn emit_kernel(k: &Kernel) -> String {
     let buf_names: Vec<&str> = k.buf_decls.iter().map(|b| b.name.as_str()).collect();
     for i in builtin_count..k.var_names.len() {
         let vn = &k.var_names[i];
-        if !buf_names.contains(&vn.as_str()) && vn != "__ret" && vn != "__call_tmp" {
+        if !buf_names.contains(&vn.as_str()) && vn != "_ret" && vn != "_call_tmp" {
             s.push_str(&format!("  var {}: u32;\n", vn));
         }
     }

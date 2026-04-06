@@ -409,7 +409,7 @@ fn parse_helper_function(
     let ret_type = parse_return_type(fn_node, source);
 
     // Create return variable
-    let ret_var = ctx.var_idx("__ret");
+    let ret_var = ctx.var_idx("_ret");
 
     let body = if let Some(body_node) = fn_node.child_by_field_name("body") {
         parse_block(&body_node, &mut ctx)?
@@ -701,7 +701,7 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
                 for rc in &ret_children {
                     if rc.kind() != "return" && rc.kind() != ";" {
                         let rhs = parse_expr(rc, ctx)?;
-                        let ret_var = ctx.var_idx("__ret");
+                        let ret_var = ctx.var_idx("_ret");
                         stmts.push(Stmt::Assign { var: ret_var, rhs });
                         break;
                     }
@@ -724,7 +724,7 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
                 if is_last && kind != "expression_statement" {
                     // Bare expression without ; → implicit return
                     if let Ok(expr) = parse_expr(child, ctx) {
-                        let ret_var = ctx.var_idx("__ret");
+                        let ret_var = ctx.var_idx("_ret");
                         stmts.push(Stmt::Assign { var: ret_var, rhs: expr });
                     } else if let Ok(s) = parse_expr_to_stmt(child, ctx) {
                         stmts.push(s);
@@ -948,7 +948,7 @@ fn try_parse_call_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Option<Stmt>, 
     let args = parse_call_args(node, ctx)?;
     let fn_id = ctx.fn_id(&func_name);
     ctx.called_fns.insert(func_name);
-    let result_var = ctx.var_idx("__call_tmp");
+    let result_var = ctx.var_idx("_call_tmp");
 
     Ok(Some(Stmt::CallStmt { fn_id, args, result_var }))
 }
@@ -1044,7 +1044,7 @@ fn parse_while(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
         then: Box::new(body),
     };
     // Use For with 0..0xFFFFFFFF as a "loop" — the break handles termination
-    let dummy = ctx.var_idx("__while_i");
+    let dummy = ctx.var_idx("_while_i");
     Ok(Stmt::For {
         var: dummy,
         start: Expr::Const(0, ScalarType::U32),
