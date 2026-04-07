@@ -2305,9 +2305,15 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
 
             // Transparent helpers: vget(v, i) → VecIndex, vslice(v, off) → BufSlice
             if func_name == "vget" && args.len() == 2 {
-                // vget(v, i) → v[i] — same as VecIndex
+                // vget(v, i) → buffer read or vec index depending on context
                 match &args[0] {
                     Expr::Var(var) => {
+                        let vn = &ctx.var_names[*var as usize];
+                        if let Some(buf) = ctx.buf_idx(vn) {
+                            // Storage buffer: emit as buf[idx]
+                            return Ok(Expr::ArrayRead(buf, Box::new(args[1].clone())));
+                        }
+                        // Vec var (local array or scratch): emit as VecIndex
                         return Ok(Expr::VecIndex(*var, Box::new(args[1].clone())));
                     },
                     _ => {}
