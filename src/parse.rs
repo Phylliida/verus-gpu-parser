@@ -83,7 +83,150 @@ impl<'a> ParseCtx<'a> {
 
 /// Parse a complete #[gpu_kernel] function + reachable helpers from source.
 /// `file_path` is used to resolve `use` imports relative to the file's crate.
+/// Pre-process Verus source for transpilation:
+/// - Strip `verus! {` and matching `}` wrapper
+/// - Remove proof/spec function declarations (they confuse the tree-sitter parser)
+/// - Remove `proof { ... }` blocks
+/// - Remove `requires`/`ensures`/`invariant`/`invariant_except_break`/`decreases` clauses
+/// - Strip `// #[gpu_...]` comments → actual `#[gpu_...]` attributes
+fn preprocess_verus_source(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let lines: Vec<&str> = source.lines().collect();
+    let mut i = 0;
+    let mut skip_depth: Option<u32> = None; // brace depth when we started skipping
+    let mut brace_depth: u32 = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        // Strip verus! { and } // verus! wrapper
+        if trimmed == "verus! {" || trimmed.starts_with("} // verus!") {
+            result.push('\n');
+            i += 1;
+            continue;
+        }
+
+        // Skip proof fn / spec fn declarations (entire function)
+        if (trimmed.starts_with("proof fn ") || trimmed.starts_with("pub proof fn ")
+            || trimmed.starts_with("spec fn ") || trimmed.starts_with("pub spec fn ")
+            || trimmed.starts_with("pub open spec fn ") || trimmed.starts_with("open spec fn "))
+            && skip_depth.is_none()
+        {
+            // Skip until we find the matching closing brace
+            let start_depth = brace_depth;
+            let mut found_open = false;
+            while i < lines.len() {
+                for ch in lines[i].chars() {
+                    if ch == '{' { brace_depth += 1; found_open = true; }
+                    if ch == '}' { brace_depth -= 1; }
+                }
+                result.push('\n'); // preserve line numbers
+                i += 1;
+                if found_open && brace_depth == start_depth { break; }
+                // Handle signature-only (no body, e.g. function_signature_item ending with ;)
+                if !found_open && lines.get(i.wrapping_sub(1)).map_or(false, |l| l.trim().ends_with(';')) { break; }
+            }
+            continue;
+        }
+
+        // Skip proof { ... } blocks inline
+        if trimmed.starts_with("proof {") || trimmed == "proof {" {
+            let start_depth = brace_depth;
+            for ch in trimmed.chars() {
+                if ch == '{' { brace_depth += 1; }
+                if ch == '}' { brace_depth -= 1; }
+            }
+            result.push('\n');
+            i += 1;
+            if brace_depth > start_depth {
+                // Multi-line proof block — skip until matching }
+                while i < lines.len() {
+                    for ch in lines[i].chars() {
+                        if ch == '{' { brace_depth += 1; }
+                        if ch == '}' { brace_depth -= 1; }
+                    }
+                    result.push('\n');
+                    i += 1;
+                    if brace_depth == start_depth { break; }
+                }
+            }
+            continue;
+        }
+
+        // Strip requires/ensures/invariant/decreases clauses
+        // These appear between `)` and `{` for fn signatures, or after `while cond` for loops
+        if trimmed.starts_with("requires") || trimmed.starts_with("ensures")
+            || trimmed.starts_with("invariant_except_break") || trimmed.starts_with("invariant")
+            || trimmed.starts_with("decreases")
+        {
+            // Skip clause lines entirely (no blank line substitution)
+            // until we hit `{` (body start) or another clause keyword
+            i += 1;
+            while i < lines.len() {
+                let next = lines[i].trim();
+                if next.starts_with("{") || next.starts_with("requires")
+                    || next.starts_with("ensures") || next.starts_with("invariant")
+                    || next.starts_with("decreases")
+                {
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Uncomment #[gpu_...] annotations
+        if trimmed.starts_with("// #[gpu_") {
+            let uncommented = line.replacen("// ", "", 1);
+            result.push_str(&uncommented);
+            result.push('\n');
+            i += 1;
+            continue;
+        }
+
+        // Skip ghost let bindings
+        if trimmed.starts_with("let ghost ") {
+            result.push('\n');
+            i += 1;
+            continue;
+        }
+
+        // Skip assert(...) statements
+        if trimmed.starts_with("assert(") || trimmed.starts_with("assert!(") {
+            // May span multiple lines
+            let mut depth_parens: i32 = 0;
+            loop {
+                for ch in lines[i].chars() {
+                    if ch == '(' { depth_parens += 1; }
+                    if ch == ')' { depth_parens -= 1; }
+                }
+                result.push('\n');
+                i += 1;
+                if depth_parens <= 0 || i >= lines.len() { break; }
+            }
+            continue;
+        }
+
+        // Normal line — convert Vec<u32> types to [u32] for buffer compatibility
+        let line_out = line.replace("&Vec<u32>", "&[u32]").replace("&mut Vec<u32>", "&mut [u32]");
+        result.push_str(&line_out);
+        result.push('\n');
+        i += 1;
+    }
+
+    result
+}
+
 pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String> {
+    // Pre-process: strip Verus-specific constructs, unwrap verus!{}
+    let processed = preprocess_verus_source(source);
+    // Debug: write preprocessed source
+    if std::env::var("GPU_TRANSPILE_DEBUG").is_ok() {
+        std::fs::write("/tmp/preprocessed_kernel.rs", &processed).ok();
+    }
+    let source = &processed;
+
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_verus::LANGUAGE.into())
         .map_err(|e| format!("Failed to load Verus grammar: {}", e))?;
