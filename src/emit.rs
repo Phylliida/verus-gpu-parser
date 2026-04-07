@@ -132,8 +132,19 @@ fn emit_expr_ctx(e: &Expr, var_names: &[String], buf_decls: &[BufDecl], funcs: &
             format!("{}({})", scalar_type_str(ty), emit_expr_ctx(inner, var_names, buf_decls, funcs, vec_buf_map)),
         Expr::Call(fn_id, args) => {
             let name = fn_name(funcs, *fn_id);
+            // Drop args that are shared memory buffer variables (wg_mem etc.)
+            // These are accessed globally by the _wg_mem variant, not passed as args
             let arg_strs: Vec<String> = args.iter()
-                .map(|a| emit_expr_ctx(a, var_names, buf_decls, funcs, vec_buf_map))
+                .map(|a| {
+                    // Replace shared memory buffer args with 0u (base offset)
+                    if let Expr::Var(var_id) = a {
+                        let vn = var_name(var_names, *var_id);
+                        if buf_decls.iter().any(|b| b.name == vn && b.binding >= 1000) {
+                            return "0u".to_string();
+                        }
+                    }
+                    emit_expr_ctx(a, var_names, buf_decls, funcs, vec_buf_map)
+                })
                 .collect();
             format!("{}({})", name, arg_strs.join(", "))
         },
@@ -228,8 +239,17 @@ fn emit_stmt_ctx(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
         },
         Stmt::CallStmt { fn_id, args, result_var } => {
             let name = fn_name(funcs, *fn_id);
+            // Replace shared memory buffer args with 0u (base offset)
             let arg_strs: Vec<String> = args.iter()
-                .map(|a| emit_expr_ctx(a, var_names, buf_decls, funcs, vec_buf_map))
+                .map(|a| {
+                    if let Expr::Var(var_id) = a {
+                        let vn = var_name(var_names, *var_id);
+                        if buf_decls.iter().any(|b| b.name == vn && b.binding >= 1000) {
+                            return "0u".to_string();
+                        }
+                    }
+                    emit_expr_ctx(a, var_names, buf_decls, funcs, vec_buf_map)
+                })
                 .collect();
             format!("{}{} = {}({});\n", pad, var_name(var_names, *result_var),
                     name, arg_strs.join(", "))
