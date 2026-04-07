@@ -96,12 +96,8 @@ fn preprocess_verus_source(source: &str) -> String {
         let line = lines[i];
         let trimmed = line.trim();
 
-        // Strip verus! { and closing } // verus!
-        if trimmed == "verus! {" || trimmed.starts_with("} // verus!") || trimmed == "} // verus!" {
-            result.push('\n');
-            i += 1;
-            continue;
-        }
+        // Keep verus! { wrapper — tree-sitter-verus needs it for proper parsing
+        // (Don't strip it)
 
         // Uncomment // #[gpu_...] annotations
         if trimmed.starts_with("// #[gpu_") {
@@ -132,7 +128,10 @@ fn preprocess_verus_source(source: &str) -> String {
         }
 
         // Skip non-kernel fn definitions (helper fns with requires/ensures)
-        if trimmed.starts_with("fn ") && !trimmed.contains("mandelbrot_perturbation") {
+        // Don't skip the kernel function (preceded by #[gpu_kernel])
+        let prev_is_gpu_kernel = if i > 0 { lines[i-1].trim().contains("gpu_kernel") } else { false };
+        if trimmed.starts_with("fn ") && !prev_is_gpu_kernel {
+            eprintln!("  STRIPPING fn at L{}: {:?} (prev: {:?})", i+1, trimmed, if i > 0 { lines[i-1].trim() } else { "" });
             let start_depth = brace_depth;
             let mut found_open = false;
             while i < lines.len() {
@@ -399,9 +398,16 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
     eprintln!("  kernel_fn kind={} L{}-L{}", kernel_fn_node.kind(),
         kernel_fn_node.start_position().row + 1, kernel_fn_node.end_position().row + 1);
     let final_body = if let Some(body_node) = kernel_fn_node.child_by_field_name("body") {
-        eprintln!("  body found: kind={} L{}-L{} children={}",
-            body_node.kind(), body_node.start_position().row + 1,
-            body_node.end_position().row + 1, body_node.child_count());
+        {
+            let mut cursor_d = body_node.walk();
+            let mut kinds_d: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for child in body_node.children(&mut cursor_d) {
+                *kinds_d.entry(child.kind().to_string()).or_default() += 1;
+            }
+            let mut kv: Vec<_> = kinds_d.into_iter().collect();
+            kv.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+            eprintln!("  body L{}-L{}: {:?}", body_node.start_position().row+1, body_node.end_position().row+1, kv);
+        }
         parse_block(&body_node, &mut final_ctx)?
     } else {
         // For ERROR nodes, find the block child
@@ -1716,6 +1722,7 @@ fn parse_expr_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
             ";" => continue,
             "if_expression" => return parse_if(&child, ctx),
             "for_expression" => return parse_for(&child, ctx),
+            "while_expression" => return parse_while(&child, ctx),
             "return_expression" => return Ok(Stmt::Return),
             "break_expression" => return Ok(Stmt::Break),
             "continue_expression" => return Ok(Stmt::Continue),
