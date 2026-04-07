@@ -645,6 +645,10 @@ fn emit_function_single(f: &GpuFunction, all_funcs: &[GpuFunction], fn_idx: usiz
         None => base_name.clone(),
     };
 
+    // Debug: emit function param info for troubleshooting
+    // if f.name.contains("slice_vec") || f.name.contains("signed_mul_to") {
+    //     eprintln!("  EMIT fn={} params={:?} vbm={:?}", f.name, f.params, f.vec_buffer_map);
+    // }
     // Signature — look up each Vec param's buffer to decide type
     let mut param_strs: Vec<String> = f.params.iter()
         .map(|(name, ty)| match ty {

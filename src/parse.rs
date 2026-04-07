@@ -127,24 +127,8 @@ fn preprocess_verus_source(source: &str) -> String {
             continue;
         }
 
-        // Skip non-kernel fn definitions (helper fns with requires/ensures)
-        // Don't skip the kernel function (preceded by #[gpu_kernel])
-        let prev_is_gpu_kernel = if i > 0 { lines[i-1].trim().contains("gpu_kernel") } else { false };
-        if trimmed.starts_with("fn ") && !prev_is_gpu_kernel {
-            eprintln!("  STRIPPING fn at L{}: {:?} (prev: {:?})", i+1, trimmed, if i > 0 { lines[i-1].trim() } else { "" });
-            let start_depth = brace_depth;
-            let mut found_open = false;
-            while i < lines.len() {
-                for ch in lines[i].chars() {
-                    if ch == '{' { brace_depth += 1; found_open = true; }
-                    if ch == '}' { brace_depth -= 1; }
-                }
-                result.push('\n');
-                i += 1;
-                if found_open && brace_depth == start_depth { break; }
-            }
-            continue;
-        }
+        // Keep exec fn definitions (copy_limbs etc.) — they're parsed by tree-sitter
+        // Only proof fn, spec fn, #[inline], #[verifier::external_body] are stripped above
 
         // Skip proof { ... } blocks
         if trimmed.starts_with("proof {") || trimmed == "proof {" {
@@ -1259,7 +1243,10 @@ fn parse_typed_parameters(params_node: &Node, ctx: &mut ParseCtx) -> Vec<(String
         if kind == "parameter" {
             let raw_name = extract_param_name(child, ctx.source);
             // Detect Vec<u32> or &Vec<u32> parameters
-            let param_type = if text.contains("Vec<") || text.contains("Vec <") {
+            let param_type = if text.contains("Vec<") || text.contains("Vec <")
+                || text.contains("&[") || text.contains("& [")
+                || text.contains("&mut [")
+            {
                 ctx.vec_vars.insert(raw_name.clone());
                 ParamType::VecU32
             } else {
