@@ -892,12 +892,45 @@ pub fn emit_kernel(k: &Kernel) -> String {
     }
 
     // Buffer declarations (skip synthetic __local_ buffers, shared memory, and unused buffers)
-    // First emit all functions to a temp string so we can check buffer usage
-    let mut func_str = String::new();
+    // First emit all functions individually
+    let mut per_func: Vec<(String, String)> = Vec::new(); // (name, source)
     for (i, f) in k.functions.iter().enumerate() {
-        func_str.push_str(&emit_function(f, &k.functions, i));
+        let name = fn_name(&k.functions, i as u32);
+        let src = emit_function(f, &k.functions, i);
+        per_func.push((name, src));
     }
     let kernel_body_str = emit_stmt_ctx(&k.body, &k.var_names, &k.buf_decls, &k.functions, 1, &kernel_vec_buf_map);
+
+    // Filter: only include functions that are transitively referenced from the kernel body
+    let mut used_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Seed with functions called from kernel body
+    for (name, _) in &per_func {
+        if kernel_body_str.contains(&format!("{}(", name)) {
+            used_fns.insert(name.clone());
+        }
+    }
+    // Transitive closure: add functions called by used functions
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (name, src) in &per_func {
+            if used_fns.contains(name) {
+                for (other_name, _) in &per_func {
+                    if !used_fns.contains(other_name) && src.contains(&format!("{}(", other_name)) {
+                        used_fns.insert(other_name.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    // Build func_str from used functions only
+    let mut func_str = String::new();
+    for (name, src) in &per_func {
+        if used_fns.contains(name) {
+            func_str.push_str(src);
+        }
+    }
 
     for buf in &k.buf_decls {
         if is_local_buf(&buf.name) { continue; }
