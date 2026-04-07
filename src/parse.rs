@@ -1247,6 +1247,12 @@ fn parse_parameters(params_node: &Node, ctx: &mut ParseCtx) {
             pending_attr = Some(text.to_string());
             continue;
         }
+        // Also check comments for GPU annotations (for Verus-compatible kernels)
+        if kind == "line_comment" && (text.contains("gpu_builtin") || text.contains("gpu_buffer")
+            || text.contains("gpu_shared") || text.contains("gpu_kernel")) {
+            pending_attr = Some(text.to_string());
+            continue;
+        }
 
         if kind == "parameter" {
             let name = extract_param_name(child, ctx.source);
