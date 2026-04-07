@@ -83,37 +83,40 @@ impl<'a> ParseCtx<'a> {
 
 /// Parse a complete #[gpu_kernel] function + reachable helpers from source.
 /// `file_path` is used to resolve `use` imports relative to the file's crate.
-/// Pre-process Verus source for transpilation:
-/// - Strip `verus! {` and matching `}` wrapper
-/// - Remove proof/spec function declarations (they confuse the tree-sitter parser)
-/// - Remove `proof { ... }` blocks
-/// - Remove `requires`/`ensures`/`invariant`/`invariant_except_break`/`decreases` clauses
-/// - Strip `// #[gpu_...]` comments → actual `#[gpu_...]` attributes
+/// Pre-process Verus source for transpilation.
+/// Strips all Verus-specific constructs and unwraps verus!{} so the result
+/// is parseable as plain Rust by tree-sitter.
 fn preprocess_verus_source(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let lines: Vec<&str> = source.lines().collect();
     let mut i = 0;
-    let mut skip_depth: Option<u32> = None; // brace depth when we started skipping
     let mut brace_depth: u32 = 0;
 
     while i < lines.len() {
         let line = lines[i];
         let trimmed = line.trim();
 
-        // Strip verus! { and } // verus! wrapper
-        if trimmed == "verus! {" || trimmed.starts_with("} // verus!") {
+        // Strip verus! { and closing } // verus!
+        if trimmed == "verus! {" || trimmed.starts_with("} // verus!") || trimmed == "} // verus!" {
             result.push('\n');
             i += 1;
             continue;
         }
 
-        // Skip proof fn / spec fn declarations (entire function)
-        if (trimmed.starts_with("proof fn ") || trimmed.starts_with("pub proof fn ")
+        // Uncomment // #[gpu_...] annotations
+        if trimmed.starts_with("// #[gpu_") {
+            result.push_str(&line.replacen("// ", "", 1));
+            result.push('\n');
+            i += 1;
+            continue;
+        }
+
+        // Skip proof/spec/external_body function declarations (brace-matched)
+        if trimmed.starts_with("proof fn ") || trimmed.starts_with("pub proof fn ")
             || trimmed.starts_with("spec fn ") || trimmed.starts_with("pub spec fn ")
-            || trimmed.starts_with("pub open spec fn ") || trimmed.starts_with("open spec fn "))
-            && skip_depth.is_none()
+            || trimmed.starts_with("pub open spec fn ") || trimmed.starts_with("open spec fn ")
+            || trimmed.starts_with("#[verifier::external_body]") || trimmed == "#[inline]"
         {
-            // Skip until we find the matching closing brace
             let start_depth = brace_depth;
             let mut found_open = false;
             while i < lines.len() {
@@ -121,16 +124,30 @@ fn preprocess_verus_source(source: &str) -> String {
                     if ch == '{' { brace_depth += 1; found_open = true; }
                     if ch == '}' { brace_depth -= 1; }
                 }
-                result.push('\n'); // preserve line numbers
+                result.push('\n');
                 i += 1;
                 if found_open && brace_depth == start_depth { break; }
-                // Handle signature-only (no body, e.g. function_signature_item ending with ;)
-                if !found_open && lines.get(i.wrapping_sub(1)).map_or(false, |l| l.trim().ends_with(';')) { break; }
             }
             continue;
         }
 
-        // Skip proof { ... } blocks inline
+        // Skip non-kernel fn definitions (helper fns with requires/ensures)
+        if trimmed.starts_with("fn ") && !trimmed.contains("mandelbrot_perturbation") {
+            let start_depth = brace_depth;
+            let mut found_open = false;
+            while i < lines.len() {
+                for ch in lines[i].chars() {
+                    if ch == '{' { brace_depth += 1; found_open = true; }
+                    if ch == '}' { brace_depth -= 1; }
+                }
+                result.push('\n');
+                i += 1;
+                if found_open && brace_depth == start_depth { break; }
+            }
+            continue;
+        }
+
+        // Skip proof { ... } blocks
         if trimmed.starts_with("proof {") || trimmed == "proof {" {
             let start_depth = brace_depth;
             for ch in trimmed.chars() {
@@ -140,7 +157,6 @@ fn preprocess_verus_source(source: &str) -> String {
             result.push('\n');
             i += 1;
             if brace_depth > start_depth {
-                // Multi-line proof block — skip until matching }
                 while i < lines.len() {
                     for ch in lines[i].chars() {
                         if ch == '{' { brace_depth += 1; }
@@ -154,74 +170,60 @@ fn preprocess_verus_source(source: &str) -> String {
             continue;
         }
 
-        // Strip requires/ensures/invariant/decreases clauses
-        // These appear between `)` and `{` for fn signatures, or after `while cond` for loops
+        // Skip requires/ensures/invariant/decreases clauses (consume until `{`)
         if trimmed.starts_with("requires") || trimmed.starts_with("ensures")
             || trimmed.starts_with("invariant_except_break") || trimmed.starts_with("invariant")
             || trimmed.starts_with("decreases")
         {
-            // Skip clause lines entirely (no blank line substitution)
-            // until we hit `{` (body start) or another clause keyword
             i += 1;
             while i < lines.len() {
                 let next = lines[i].trim();
                 if next.starts_with("{") || next.starts_with("requires")
                     || next.starts_with("ensures") || next.starts_with("invariant")
                     || next.starts_with("decreases")
-                {
-                    break;
-                }
+                { break; }
                 i += 1;
             }
             continue;
         }
 
-        // Uncomment #[gpu_...] annotations
-        if trimmed.starts_with("// #[gpu_") {
-            let uncommented = line.replacen("// ", "", 1);
-            result.push_str(&uncommented);
-            result.push('\n');
-            i += 1;
-            continue;
-        }
-
-        // Skip ghost let bindings
+        // Skip ghost let bindings and assert statements
         if trimmed.starts_with("let ghost ") {
             result.push('\n');
             i += 1;
             continue;
         }
-
-        // Skip assert(...) statements
         if trimmed.starts_with("assert(") || trimmed.starts_with("assert!(") {
-            // May span multiple lines
-            let mut depth_parens: i32 = 0;
+            let mut paren_depth: i32 = 0;
             loop {
                 for ch in lines[i].chars() {
-                    if ch == '(' { depth_parens += 1; }
-                    if ch == ')' { depth_parens -= 1; }
+                    if ch == '(' { paren_depth += 1; }
+                    if ch == ')' { paren_depth -= 1; }
                 }
                 result.push('\n');
                 i += 1;
-                if depth_parens <= 0 || i >= lines.len() { break; }
+                if paren_depth <= 0 || i >= lines.len() { break; }
             }
             continue;
         }
 
-        // Normal line — convert Vec<u32> types to [u32] for buffer compatibility
-        let line_out = line.replace("&Vec<u32>", "&[u32]").replace("&mut Vec<u32>", "&mut [u32]");
-        result.push_str(&line_out);
+        // Apply text transformations
+        let out = line
+            .replace("&Vec<u32>", "&[u32]")
+            .replace("&mut Vec<u32>", "&mut [u32]")
+            .replace(" as usize", "")
+            .replace(": Vec<u32>", "");
+
+        result.push_str(&out);
         result.push('\n');
         i += 1;
     }
-
     result
 }
 
 pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String> {
-    // Pre-process: strip Verus-specific constructs, unwrap verus!{}
+    // Pre-process: uncomment gpu annotations, convert Vec<u32> → [u32], strip `as usize`
     let processed = preprocess_verus_source(source);
-    // Debug: write preprocessed source
     if std::env::var("GPU_TRANSPILE_DEBUG").is_ok() {
         std::fs::write("/tmp/preprocessed_kernel.rs", &processed).ok();
     }
@@ -380,14 +382,37 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         skipped_vars: HashSet::new(),
     };
 
+    // For ERROR nodes (kernel inside verus!{}), find parameters and body by searching children
     if let Some(params) = kernel_fn_node.child_by_field_name("parameters") {
         parse_parameters(&params, &mut final_ctx);
+    } else if kernel_fn_node.kind() == "ERROR" {
+        // Search children for parameters_and_body node or parameter list
+        let mut cursor = kernel_fn_node.walk();
+        for child in kernel_fn_node.children(&mut cursor) {
+            if child.kind() == "parameters" || child.kind() == "field_declaration_list" {
+                parse_parameters(&child, &mut final_ctx);
+                break;
+            }
+        }
     }
 
+    eprintln!("  kernel_fn kind={} L{}-L{}", kernel_fn_node.kind(),
+        kernel_fn_node.start_position().row + 1, kernel_fn_node.end_position().row + 1);
     let final_body = if let Some(body_node) = kernel_fn_node.child_by_field_name("body") {
+        eprintln!("  body found: kind={} L{}-L{} children={}",
+            body_node.kind(), body_node.start_position().row + 1,
+            body_node.end_position().row + 1, body_node.child_count());
         parse_block(&body_node, &mut final_ctx)?
     } else {
-        Stmt::Noop
+        // For ERROR nodes, find the block child
+        let mut cursor = kernel_fn_node.walk();
+        let mut body_stmt = Stmt::Noop;
+        for child in kernel_fn_node.children(&mut cursor) {
+            if child.kind() == "block" {
+                body_stmt = parse_block(&child, &mut final_ctx)?;
+            }
+        }
+        body_stmt
     };
 
     // Phase 7-9: Collect ALL unique buffer mappings per function from call sites,
@@ -1317,11 +1342,16 @@ fn find_gpu_kernel_fn<'a>(node: &Node<'a>, source: &str) -> Option<Node<'a>> {
         }
 
         match child.kind() {
-            "function_item" => {
+            "function_item" | "function_signature_item" => {
                 if text.contains("gpu_kernel") || prev_has_gpu_kernel {
                     return Some(*child);
                 }
                 prev_has_gpu_kernel = false;
+            },
+            // Inside verus!{}, the kernel may be parsed as ERROR if requires/ensures
+            // confuse the parser outside the verus block context
+            "ERROR" if prev_has_gpu_kernel && text.starts_with("fn ") => {
+                return Some(*child);
             },
             _ => {
                 if let Some(f) = find_gpu_kernel_fn(child, source) {
@@ -1478,7 +1508,7 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
         let is_last = Some(child.id()) == last_meaningful;
         match kind {
             "{" | "}" => {},
-            "line_comment" => {
+            "line_comment" | "attribute_item" => {
                 let text = ctx.text(child);
                 if let Some(size) = parse_gpu_local_size(text) {
                     pending_gpu_local = Some(size);
