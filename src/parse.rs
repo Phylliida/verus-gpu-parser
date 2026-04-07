@@ -1651,6 +1651,36 @@ fn parse_expr_to_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
         }
     }
 
+    // Transparent helper: vset(v, i, val) → ScratchWrite or BufWrite
+    if node.kind() == "call_expression" {
+        let func = node.child_by_field_name("function");
+        if let Some(func_node) = func {
+            let fn_text = ctx.text(&func_node).to_string();
+            let fn_name_str = fn_text.split("::").last().unwrap_or(&fn_text);
+            if fn_name_str == "vset" {
+                let args = parse_call_args(node, ctx)?;
+                if args.len() == 3 {
+                    match &args[0] {
+                        Expr::Var(var) => {
+                            let vn = ctx.var_names[*var as usize].clone();
+                            if let Some(buf) = ctx.buf_idx(&vn) {
+                                return Ok(Stmt::BufWrite { buf, idx: args[1].clone(), val: args[2].clone() });
+                            }
+                            // Vec var: write to scratch at vec_off + idx
+                            return Ok(Stmt::ScratchWrite {
+                                offset: Expr::BinOp(BinOp::Add,
+                                    Box::new(Expr::Var(*var)),
+                                    Box::new(args[1].clone())),
+                                val: args[2].clone(),
+                            });
+                        },
+                        _ => {},
+                    }
+                }
+            }
+        }
+    }
+
     // Function call as statement: f(args) → CallStmt with result discarded
     if node.kind() == "call_expression" {
         if let Some(call_stmt) = try_parse_call_stmt(node, ctx)? {
@@ -2092,6 +2122,34 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
             // Regular function call — strip type prefixes like T:: or Self::
             let func_name = func_text.split("::").last().unwrap_or(&func_text).to_string();
             let args = parse_call_args(node, ctx)?;
+
+            // Transparent helpers: vget(v, i) → VecIndex, vslice(v, off) → BufSlice
+            if func_name == "vget" && args.len() == 2 {
+                // vget(v, i) → v[i] — same as VecIndex
+                match &args[0] {
+                    Expr::Var(var) => {
+                        return Ok(Expr::VecIndex(*var, Box::new(args[1].clone())));
+                    },
+                    _ => {}
+                }
+            }
+            if func_name == "vslice" && args.len() == 2 {
+                // vslice(v, off) → BufSlice(buf, off) or vec_var + off
+                match &args[0] {
+                    Expr::Var(var) => {
+                        let vn = &ctx.var_names[*var as usize];
+                        if let Some(buf) = ctx.buf_idx(vn) {
+                            return Ok(Expr::BufSlice(buf, Box::new(args[1].clone())));
+                        }
+                        // Vec var: return vec_var + offset for scratch-based access
+                        return Ok(Expr::BinOp(BinOp::Add,
+                            Box::new(Expr::Var(*var)),
+                            Box::new(args[1].clone())));
+                    },
+                    _ => {}
+                }
+            }
+
             let fn_id = ctx.fn_id(&func_name);
             ctx.called_fns.insert(func_name);
             Ok(Expr::Call(fn_id, args))
