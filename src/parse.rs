@@ -28,6 +28,12 @@ struct ParseCtx<'a> {
     local_arrays: HashMap<String, u32>,
     /// Variables annotated with #[gpu_skip] — treated as plain scalars.
     skipped_vars: HashSet<String>,
+    /// Slice aliases: `let x = vslice(buf, off)` → x maps to buffer name
+    /// (the name of the buffer the slice is taken from). When x is used as
+    /// a Vec arg in a later function call, the call-site resolution walks
+    /// this map to find the underlying buffer.
+    /// Maps var_name → buffer name (matching `buf_decls` or `__local_N`).
+    slice_aliases: HashMap<String, String>,
 }
 
 impl<'a> ParseCtx<'a> {
@@ -243,6 +249,7 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         vec_vars: HashSet::new(),
         local_arrays: HashMap::new(),
         skipped_vars: HashSet::new(),
+        slice_aliases: HashMap::new(),
     };
 
     let name = kernel_fn_node.child_by_field_name("name")
@@ -288,9 +295,10 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
                 builtin_names: Vec::new(),
                 fn_name_to_id: ctx.fn_name_to_id.clone(),
                 called_fns: HashSet::new(),
-        vec_vars: HashSet::new(),
-        local_arrays: HashMap::new(),
-        skipped_vars: HashSet::new(),
+                vec_vars: HashSet::new(),
+                local_arrays: HashMap::new(),
+                skipped_vars: HashSet::new(),
+                slice_aliases: HashMap::new(),
             };
             if let Some(params) = fn_node.child_by_field_name("parameters") {
                 parse_helper_parameters(&params, &mut helper_ctx);
@@ -363,6 +371,7 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         vec_vars: HashSet::new(),
         local_arrays: HashMap::new(),
         skipped_vars: HashSet::new(),
+        slice_aliases: HashMap::new(),
     };
 
     // For ERROR nodes (kernel inside verus!{}), find parameters and body by searching children
@@ -407,7 +416,7 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
 
     // Phase 7-9: Collect ALL unique buffer mappings per function from call sites,
     // propagate through call chain, and duplicate functions for each unique mapping.
-    monomorphize_all(&final_body, &final_ctx.buf_decls, &mut functions, &final_ctx.var_names, &final_ctx.local_arrays);
+    monomorphize_all(&final_body, &final_ctx.buf_decls, &mut functions, &final_ctx.var_names, &final_ctx.local_arrays, &final_ctx.slice_aliases);
 
     // Phase 10: Rewrite Call expressions to point to the correct monomorphized variant.
     // Each call site's buffer args determine which variant to use.
@@ -452,13 +461,20 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
 
 /// Monomorphize all Vec-param functions: for each unique buffer combination
 /// at call sites, create a separate copy of the function with that mapping.
-fn monomorphize_all(kernel_body: &Stmt, buf_decls: &[BufDecl], functions: &mut Vec<GpuFunction>, kernel_var_names: &[String], kernel_local_arrays: &HashMap<String, u32>) {
+fn monomorphize_all(
+    kernel_body: &Stmt,
+    buf_decls: &[BufDecl],
+    functions: &mut Vec<GpuFunction>,
+    kernel_var_names: &[String],
+    kernel_local_arrays: &HashMap<String, u32>,
+    kernel_slice_aliases: &HashMap<String, String>,
+) {
     // Step 1: Collect all (fn_idx, buffer_mapping) pairs from call sites.
     // Start from kernel body, then propagate through the call chain.
     let mut all_mappings: HashMap<usize, Vec<Vec<(String, String)>>> = HashMap::new();
 
     // Scan kernel body for BufSlice and Var args that map to buffers
-    collect_call_mappings(kernel_body, buf_decls, functions, kernel_var_names, &kernel_local_arrays, &mut all_mappings);
+    collect_call_mappings(kernel_body, buf_decls, functions, kernel_var_names, kernel_local_arrays, kernel_slice_aliases, &mut all_mappings);
 
     // Step 2: Propagate — for each function with a mapping, scan ITS body
     // to find calls to other functions and resolve their mappings.
@@ -477,6 +493,9 @@ fn monomorphize_all(kernel_body: &Stmt, buf_decls: &[BufDecl], functions: &mut V
 
         // Build this function's param→buffer lookup
         let caller_lookup: HashMap<String, String> = mapping.iter().cloned().collect();
+        // Also consult this function's slice_aliases (from its own parsing)
+        // so that `let x = vslice(buf, off); callee(x, ...)` resolves x to buf.
+        let caller_slice_aliases = functions[fn_idx].slice_aliases.clone();
 
         // Scan body for calls
         let calls = collect_calls_from_stmt(&functions[fn_idx].body);
@@ -498,13 +517,16 @@ fn monomorphize_all(kernel_body: &Stmt, buf_decls: &[BufDecl], functions: &mut V
                 if let Expr::Var(var_id) = arg {
                     let var_name_str = functions[fn_idx].var_names
                         .get(*var_id as usize).cloned().unwrap_or_default();
-                    if let Some(buf) = caller_lookup.get(&var_name_str) {
+                    // Resolve via param→buffer mapping OR slice_aliases
+                    let buf_opt = caller_lookup.get(&var_name_str).cloned()
+                        .or_else(|| caller_slice_aliases.get(&var_name_str).cloned());
+                    if let Some(buf) = buf_opt {
                         if vec_pi < callee_vec_params.len() {
-                            callee_mapping.push((callee_vec_params[vec_pi].clone(), buf.clone()));
+                            callee_mapping.push((callee_vec_params[vec_pi].clone(), buf));
                             vec_pi += 1;
                         } else {
                             // Extra = output
-                            callee_mapping.push(("out".to_string(), buf.clone()));
+                            callee_mapping.push(("out".to_string(), buf));
                         }
                     }
                 } else if let Expr::BufSlice(buf_id, _) = arg {
@@ -595,25 +617,26 @@ fn monomorphize_all(kernel_body: &Stmt, buf_decls: &[BufDecl], functions: &mut V
 fn collect_call_mappings(
     body: &Stmt, buf_decls: &[BufDecl], functions: &[GpuFunction],
     var_names: &[String], local_arrays: &HashMap<String, u32>,
+    slice_aliases: &HashMap<String, String>,
     result: &mut HashMap<usize, Vec<Vec<(String, String)>>>,
 ) {
     match body {
         Stmt::Assign { rhs, .. } | Stmt::TupleDestructure { rhs, .. } => {
-            scan_expr_for_mappings(rhs, buf_decls, functions, var_names, local_arrays, result);
+            scan_expr_for_mappings(rhs, buf_decls, functions, var_names, local_arrays, slice_aliases, result);
         },
         Stmt::CallStmt { fn_id, args, .. } => {
             let call_expr = Expr::Call(*fn_id, args.clone());
-            scan_expr_for_mappings(&call_expr, buf_decls, functions, var_names, local_arrays, result);
+            scan_expr_for_mappings(&call_expr, buf_decls, functions, var_names, local_arrays, slice_aliases, result);
         },
         Stmt::Seq { first, then } => {
-            collect_call_mappings(first, buf_decls, functions, var_names, local_arrays, result);
-            collect_call_mappings(then, buf_decls, functions, var_names, local_arrays, result);
+            collect_call_mappings(first, buf_decls, functions, var_names, local_arrays, slice_aliases, result);
+            collect_call_mappings(then, buf_decls, functions, var_names, local_arrays, slice_aliases, result);
         },
         Stmt::If { then_body, else_body, .. } => {
-            collect_call_mappings(then_body, buf_decls, functions, var_names, local_arrays, result);
-            collect_call_mappings(else_body, buf_decls, functions, var_names, local_arrays, result);
+            collect_call_mappings(then_body, buf_decls, functions, var_names, local_arrays, slice_aliases, result);
+            collect_call_mappings(else_body, buf_decls, functions, var_names, local_arrays, slice_aliases, result);
         },
-        Stmt::For { body, .. } => collect_call_mappings(body, buf_decls, functions, var_names, local_arrays, result),
+        Stmt::For { body, .. } => collect_call_mappings(body, buf_decls, functions, var_names, local_arrays, slice_aliases, result),
         _ => {},
     }
 }
@@ -621,6 +644,7 @@ fn collect_call_mappings(
 fn scan_expr_for_mappings(
     expr: &Expr, buf_decls: &[BufDecl], functions: &[GpuFunction],
     var_names: &[String], local_arrays: &HashMap<String, u32>,
+    slice_aliases: &HashMap<String, String>,
     result: &mut HashMap<usize, Vec<Vec<(String, String)>>>,
 ) {
     if let Expr::Call(fn_id, args) = expr {
@@ -650,6 +674,8 @@ fn scan_expr_for_mappings(
                                     buf_decls.iter().find(|b| &b.name == vn).map(|b| b.name.clone())
                                     // Or local array
                                     .or_else(|| local_arrays.get(vn.as_str()).map(|s| format!("__local_{}", s)))
+                                    // Or a slice alias (from `let x = vslice(buf, off)`)
+                                    .or_else(|| slice_aliases.get(vn.as_str()).cloned())
                                 })
                             },
                             _ => None,
@@ -665,7 +691,7 @@ fn scan_expr_for_mappings(
                 }
             }
         }
-        for a in args { scan_expr_for_mappings(a, buf_decls, functions, var_names, local_arrays, result); }
+        for a in args { scan_expr_for_mappings(a, buf_decls, functions, var_names, local_arrays, slice_aliases, result); }
     }
 }
 
@@ -1088,6 +1114,7 @@ fn discover_callees_from_source(
         vec_vars: HashSet::new(),
         local_arrays: HashMap::new(),
         skipped_vars: HashSet::new(),
+        slice_aliases: HashMap::new(),
     };
     if let Some(params) = fn_node.child_by_field_name("parameters") {
         parse_helper_parameters(&params, &mut helper_ctx);
@@ -1165,6 +1192,7 @@ fn parse_helper_function(
         vec_vars: HashSet::new(),
         local_arrays: HashMap::new(),
         skipped_vars: HashSet::new(),
+        slice_aliases: HashMap::new(),
     };
 
     let name = fn_node.child_by_field_name("name")
@@ -1206,6 +1234,7 @@ fn parse_helper_function(
         _ => false,
     };
 
+    let slice_aliases = ctx.slice_aliases.clone();
     Ok(GpuFunction {
         name,
         params,
@@ -1217,6 +1246,7 @@ fn parse_helper_function(
         body,
         ret_var,
         base_case,
+        slice_aliases,
     })
 }
 
@@ -1712,6 +1742,18 @@ fn parse_let(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
     } else {
         Expr::Const(0, ScalarType::I32)
     };
+
+    // Slice-alias tracking: `let x = vslice(buf, off)` makes x a slice into buf.
+    // When x is later used as a Vec-typed arg in a function call, the call-site
+    // monomorphization should resolve x to `buf`'s buffer name.
+    if let Expr::BufSlice(buf_id, _) = &rhs {
+        let buf_name = ctx.buf_decls.get(*buf_id as usize).map(|b| b.name.clone());
+        if let Some(bn) = buf_name {
+            ctx.slice_aliases.insert(name.clone(), bn);
+            // Also mark x as a Vec var so call-site scanning treats it as Vec.
+            ctx.vec_vars.insert(name.clone());
+        }
+    }
 
     Ok(Stmt::Assign { var, rhs })
 }

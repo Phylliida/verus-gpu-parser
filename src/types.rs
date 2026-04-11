@@ -122,6 +122,11 @@ pub struct GpuFunction {
     /// Base case function for recursion unrolling. Parsed from #[gpu_base_case(name)].
     /// At depth 0, self-calls are replaced with this function.
     pub base_case: Option<String>,
+    /// Slice aliases from `let x = vslice(buf, off)`. Maps local var_name
+    /// to the buffer name the slice refers to. Used during monomorphization
+    /// so that `f(x, ...)` (where x is a slice alias) resolves to
+    /// `f_variant_backed_by_<buf>(...)`.
+    pub slice_aliases: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
