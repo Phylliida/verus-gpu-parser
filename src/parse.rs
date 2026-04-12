@@ -176,10 +176,14 @@ fn preprocess_verus_source(source: &str) -> String {
             continue;
         }
 
-        // Skip ghost let bindings and assert statements
+        // Skip ghost let bindings (may span multiple lines, consume until `;`)
         if trimmed.starts_with("let ghost ") {
-            result.push('\n');
-            i += 1;
+            while i < lines.len() {
+                let has_semi = lines[i].contains(';');
+                result.push('\n');
+                i += 1;
+                if has_semi { break; }
+            }
             continue;
         }
         if trimmed.starts_with("assert(") || trimmed.starts_with("assert!(") {
@@ -195,6 +199,22 @@ fn preprocess_verus_source(source: &str) -> String {
             }
             continue;
         }
+
+        // Strip Verus named-return syntax: ") -> (name: Type)" → ") -> Type"
+        // e.g. ") -> (out: (u32, u32, u32))" → ") -> (u32, u32, u32)"
+        let line_buf;
+        let line = if let Some(arrow_idx) = trimmed.find(") -> (") {
+            let after_paren = &trimmed[arrow_idx + 6..]; // after ") -> (" (6 chars)
+            if let Some(colon_idx) = after_paren.find(": ") {
+                let name_part = &after_paren[..colon_idx];
+                if name_part.trim().chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    let type_part = after_paren[colon_idx + 2..].trim();
+                    let type_part = type_part.strip_suffix(')').unwrap_or(type_part);
+                    line_buf = format!(") -> {}", type_part);
+                    &line_buf
+                } else { line }
+            } else { line }
+        } else { line };
 
         // Apply text transformations
         let out = line
