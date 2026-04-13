@@ -1791,7 +1791,23 @@ fn parse_expr_stmt(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
             "if_expression" => return parse_if(&child, ctx),
             "for_expression" => return parse_for(&child, ctx),
             "while_expression" => return parse_while(&child, ctx),
-            "return_expression" => return Ok(Stmt::Return),
+            "return_expression" => {
+                // return expr → assign to _ret + Return
+                let mut cursor2 = child.walk();
+                let ret_children: Vec<Node> = child.children(&mut cursor2).collect();
+                let mut stmts = Vec::new();
+                for rc in &ret_children {
+                    if rc.kind() != "return" && rc.kind() != ";" {
+                        if let Ok(rhs) = parse_expr(rc, ctx) {
+                            let ret_var = ctx.var_idx("_ret");
+                            stmts.push(Stmt::Assign { var: ret_var, rhs });
+                        }
+                        break;
+                    }
+                }
+                stmts.push(Stmt::Return);
+                return Ok(Stmt::from_vec(stmts));
+            },
             "break_expression" => return Ok(Stmt::Break),
             "continue_expression" => return Ok(Stmt::Continue),
             _ => return parse_expr_to_stmt(&child, ctx),
