@@ -2088,7 +2088,15 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
                 .trim_end_matches("usize").trim_end_matches("isize")
                 .trim_end_matches("u8").trim_end_matches("i8")
                 .trim_end_matches("u16").trim_end_matches("i16");
-            let val: i64 = num_str.parse().unwrap_or(0);
+            let val: i64 = if num_str.starts_with("0x") || num_str.starts_with("0X") {
+                i64::from_str_radix(&num_str[2..], 16).unwrap_or(0)
+            } else if num_str.starts_with("0b") || num_str.starts_with("0B") {
+                i64::from_str_radix(&num_str[2..], 2).unwrap_or(0)
+            } else if num_str.starts_with("0o") || num_str.starts_with("0O") {
+                i64::from_str_radix(&num_str[2..], 8).unwrap_or(0)
+            } else {
+                num_str.replace('_', "").parse().unwrap_or(0)
+            };
             Ok(Expr::Const(val, ty))
         },
         "float_literal" => {
