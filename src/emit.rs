@@ -330,7 +330,13 @@ fn emit_stmt_ctx(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs: &
                         pad, buf, vn, len_var, val_str, pad, len_var, len_var)
             }
         },
-        Stmt::Return => format!("{}return _ret;\n", pad),
+        Stmt::Return => {
+            if var_names.contains(&"_ret".to_string()) {
+                format!("{}return _ret;\n", pad)
+            } else {
+                format!("{}return;\n", pad)
+            }
+        },
         Stmt::Noop => String::new(),
     }
 }
@@ -840,7 +846,13 @@ fn emit_stmt_depth(s: &Stmt, var_names: &[String], buf_decls: &[BufDecl], funcs:
             };
             format!("{}{};\n", pad, name)
         },
-        Stmt::Return => format!("{}return _ret;\n", pad),
+        Stmt::Return => {
+            if var_names.contains(&"_ret".to_string()) {
+                format!("{}return _ret;\n", pad)
+            } else {
+                format!("{}return;\n", pad)
+            }
+        },
         Stmt::Noop => String::new(),
     }
 }
