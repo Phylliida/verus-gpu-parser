@@ -1638,6 +1638,11 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
                 }
                 stmts.push(Stmt::Return);
             },
+            "block" => {
+                // Bare { ... } blocks — recursively parse their contents
+                let inner = parse_block(child, ctx)?;
+                stmts.push(inner);
+            },
             "break_expression" => stmts.push(Stmt::Break),
             "continue_expression" => stmts.push(Stmt::Continue),
             // Skip Verus-specific clauses
