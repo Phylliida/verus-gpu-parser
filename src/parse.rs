@@ -11,6 +11,86 @@ use crate::types::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+/// Remap stale fn_ids in a statement tree.
+fn remap_fn_ids_in_stmt(stmt: &mut Stmt, remap: &HashMap<u32, u32>) {
+    match stmt {
+        Stmt::Assign { rhs, .. } | Stmt::TupleDestructure { rhs, .. } => remap_fn_ids_in_expr(rhs, remap),
+        Stmt::CallStmt { fn_id, args, .. } => {
+            if let Some(&new_id) = remap.get(fn_id) { *fn_id = new_id; }
+            for arg in args { remap_fn_ids_in_expr(arg, remap); }
+        },
+        Stmt::Seq { first, then } => {
+            remap_fn_ids_in_stmt(first, remap);
+            remap_fn_ids_in_stmt(then, remap);
+        },
+        Stmt::If { cond, then_body, else_body } => {
+            remap_fn_ids_in_expr(cond, remap);
+            remap_fn_ids_in_stmt(then_body, remap);
+            remap_fn_ids_in_stmt(else_body, remap);
+        },
+        Stmt::For { start, end, body, .. } => {
+            remap_fn_ids_in_expr(start, remap);
+            remap_fn_ids_in_expr(end, remap);
+            remap_fn_ids_in_stmt(body, remap);
+        },
+        _ => {},
+    }
+}
+
+fn fix_out_of_range_fn_ids(stmt: &mut Stmt, max_id: u32, fn_id_map: &HashMap<String, u32>) {
+    match stmt {
+        Stmt::Assign { rhs, .. } | Stmt::TupleDestructure { rhs, .. } => fix_oor_expr(rhs, max_id),
+        Stmt::CallStmt { fn_id, args, .. } => {
+            if *fn_id >= max_id { *fn_id = max_id.saturating_sub(1); }
+            for arg in args { fix_oor_expr(arg, max_id); }
+        },
+        Stmt::Seq { first, then } => {
+            fix_out_of_range_fn_ids(first, max_id, fn_id_map);
+            fix_out_of_range_fn_ids(then, max_id, fn_id_map);
+        },
+        Stmt::If { cond, then_body, else_body } => {
+            fix_oor_expr(cond, max_id);
+            fix_out_of_range_fn_ids(then_body, max_id, fn_id_map);
+            fix_out_of_range_fn_ids(else_body, max_id, fn_id_map);
+        },
+        Stmt::For { start, end, body, .. } => {
+            fix_oor_expr(start, max_id); fix_oor_expr(end, max_id);
+            fix_out_of_range_fn_ids(body, max_id, fn_id_map);
+        },
+        _ => {},
+    }
+}
+
+fn fix_oor_expr(expr: &mut Expr, max_id: u32) {
+    match expr {
+        Expr::Call(fn_id, args) => {
+            if *fn_id >= max_id {
+                eprintln!("  [fix_oor] Clamping fn_id {} → {} (out of range)", *fn_id, max_id.saturating_sub(1));
+                *fn_id = max_id.saturating_sub(1);
+            }
+            for arg in args { fix_oor_expr(arg, max_id); }
+        },
+        Expr::BinOp(_, l, r) => { fix_oor_expr(l, max_id); fix_oor_expr(r, max_id); },
+        Expr::UnaryOp(_, e) | Expr::VecIndex(_, e) | Expr::ArrayRead(_, e) | Expr::BufSlice(_, e) => fix_oor_expr(e, max_id),
+        _ => {},
+    }
+}
+
+fn remap_fn_ids_in_expr(expr: &mut Expr, remap: &HashMap<u32, u32>) {
+    match expr {
+        Expr::Call(fn_id, args) => {
+            if let Some(&new_id) = remap.get(fn_id) { *fn_id = new_id; }
+            for arg in args { remap_fn_ids_in_expr(arg, remap); }
+        },
+        Expr::BinOp(_, l, r) => { remap_fn_ids_in_expr(l, remap); remap_fn_ids_in_expr(r, remap); },
+        Expr::UnaryOp(_, e) => remap_fn_ids_in_expr(e, remap),
+        Expr::VecIndex(_, e) => remap_fn_ids_in_expr(e, remap),
+        Expr::ArrayRead(_, e) => remap_fn_ids_in_expr(e, remap),
+        Expr::BufSlice(_, e) => remap_fn_ids_in_expr(e, remap),
+        _ => {},
+    }
+}
+
 /// Parser state: source text + variable/buffer name tracking.
 struct ParseCtx<'a> {
     source: &'a str,
@@ -368,6 +448,20 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
     for (i, fn_name) in reachable.iter().enumerate() {
         fn_id_map.insert(fn_name.clone(), i as u32);
     }
+    eprintln!("Reachable: {} functions", reachable.len());
+
+    // Build old→new fn_id remap from Phase 4 names to Phase 5 indices.
+    // Phase 4 parsing assigned local fn_ids (ctx.fn_name_to_id) that may differ
+    // from the final reachable indices. When Phase 5 re-parsing fails to find
+    // a call (e.g., due to tree-sitter grammar limitations), the old fn_id persists.
+    let mut fn_id_remap_old_to_new: HashMap<u32, u32> = HashMap::new();
+    for (name, &old_id) in &ctx.fn_name_to_id {
+        if let Some(&new_id) = fn_id_map.get(name) {
+            if old_id != new_id {
+                fn_id_remap_old_to_new.insert(old_id, new_id);
+            }
+        }
+    }
 
     for fn_name in &reachable {
         if all_fns.contains_key(fn_name) {
@@ -377,6 +471,32 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         } else if let Some(fn_src) = imported_fn_sources.get(fn_name) {
             let func = parse_helper_function_from_source(fn_src, &mut parser, &fn_id_map)?;
             functions.push(func);
+        } else {
+            eprintln!("  WARNING: {} is reachable but not found in local or imported sources — fn_id {} will be wrong", fn_name, fn_id_map[fn_name]);
+        }
+    }
+
+    // Remap stale fn_ids in all function bodies.
+    // Phase 5 re-parsing may assign NEW fn_ids for calls that tree-sitter
+    // couldn't parse (e.g., due to Verus-specific syntax). These new ids
+    // are >= functions.len() and need to be remapped to the correct indices.
+    // Build remap from ALL known name→id mappings to the correct fn_id_map indices.
+    {
+        // Collect all stale name→id mappings from Phase 4 AND Phase 5 parsing
+        let mut all_stale_ids: HashMap<u32, u32> = fn_id_remap_old_to_new;
+        // Also check: any fn_id >= functions.len() in any function's fn_name_to_id
+        // is stale and needs remapping
+        for func in &functions {
+            // The function's parsed body may contain Call(stale_id, args)
+            // where stale_id was assigned during re-parsing (Phase 5) for
+            // a callee that wasn't in fn_id_map
+        }
+        // Remap any Call with fn_id >= functions.len() by name lookup
+        let num_fns = functions.len() as u32;
+        for func in &mut functions {
+            remap_fn_ids_in_stmt(&mut func.body, &all_stale_ids);
+            // Also fix out-of-range ids by trying reverse lookup
+            fix_out_of_range_fn_ids(&mut func.body, num_fns, &fn_id_map);
         }
     }
 
@@ -537,9 +657,16 @@ fn monomorphize_all(
                 if let Expr::Var(var_id) = arg {
                     let var_name_str = functions[fn_idx].var_names
                         .get(*var_id as usize).cloned().unwrap_or_default();
-                    // Resolve via param→buffer mapping OR slice_aliases
+                    // Resolve via param→buffer mapping OR slice_aliases.
+                    // slice_aliases maps local vars to parameter names (e.g. a_lo_slice → a),
+                    // so we need a second lookup through caller_lookup to get the actual buffer.
                     let buf_opt = caller_lookup.get(&var_name_str).cloned()
-                        .or_else(|| caller_slice_aliases.get(&var_name_str).cloned());
+                        .or_else(|| {
+                            caller_slice_aliases.get(&var_name_str).and_then(|alias| {
+                                caller_lookup.get(alias).cloned()
+                                    .or_else(|| caller_slice_aliases.get(alias).and_then(|a2| caller_lookup.get(a2).cloned()))
+                            })
+                        });
                     if let Some(buf) = buf_opt {
                         if vec_pi < callee_vec_params.len() {
                             callee_mapping.push((callee_vec_params[vec_pi].clone(), buf));
@@ -1584,7 +1711,13 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
                 let gpu_local_size = pending_gpu_local.take();
                 let gpu_skip = pending_gpu_skip;
                 pending_gpu_skip = false;
-                let stmt = parse_let(child, ctx)?;
+                let stmt = match parse_let(child, ctx) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("  [parse_block] let_declaration error at L{}: {}", child.start_position().row + 1, e);
+                        continue;
+                    }
+                };
                 if gpu_skip {
                     // Suppress offset assignment — variable stays as plain scalar u32.
                     // Track the var name so scratch reads/writes using it are rewritten.
@@ -1650,6 +1783,8 @@ fn parse_block(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
             | "invariant_clause" | "recommends_clause" => {},
             // Skip proof blocks and ghost code
             "proof_block" | "ghost_block" | "assert_expr" => {},
+            // Skip use declarations inside function bodies (imports resolved at top level)
+            "use_declaration" => {},
             _ => {
                 // Debug: show unknown node types
                 eprintln!("  [parse_block] unknown node: kind={}, text={:.60}", kind,
@@ -1768,15 +1903,26 @@ fn parse_let(node: &Node, ctx: &mut ParseCtx) -> Result<Stmt, String> {
         Expr::Const(0, ScalarType::I32)
     };
 
-    // Slice-alias tracking: `let x = vslice(buf, off)` makes x a slice into buf.
-    // When x is later used as a Vec-typed arg in a function call, the call-site
-    // monomorphization should resolve x to `buf`'s buffer name.
+    // Slice-alias tracking: `let x = vslice(buf, off)` or `let x = slice_subrange(a, off, len)`
+    // makes x a slice into the underlying buffer. When x is later used as a Vec-typed arg in
+    // a function call, the call-site monomorphization should resolve x to the buffer name.
     if let Expr::BufSlice(buf_id, _) = &rhs {
         let buf_name = ctx.buf_decls.get(*buf_id as usize).map(|b| b.name.clone());
         if let Some(bn) = buf_name {
             ctx.slice_aliases.insert(name.clone(), bn);
             // Also mark x as a Vec var so call-site scanning treats it as Vec.
             ctx.vec_vars.insert(name.clone());
+        }
+    }
+    // Also track offset expressions derived from Vec params: `let x = vec_var + off`
+    // (produced by slice_subrange when the base is a Vec parameter, not a buf_decl)
+    if let Expr::BinOp(BinOp::Add, lhs, _) = &rhs {
+        if let Expr::Var(var_id) = &**lhs {
+            let base_name = ctx.var_names.get(*var_id as usize).cloned().unwrap_or_default();
+            if ctx.vec_vars.contains(&base_name) {
+                ctx.slice_aliases.insert(name.clone(), base_name);
+                ctx.vec_vars.insert(name.clone());
+            }
         }
     }
 
@@ -2411,6 +2557,32 @@ fn parse_expr(node: &Node, ctx: &mut ParseCtx) -> Result<Expr, String> {
                         return Ok(Expr::VecIndex(*var, Box::new(args[1].clone())));
                     },
                     _ => {}
+                }
+            }
+            // slice_subrange(a, start, end) → a + start (offset into same buffer)
+            // The `end` parameter is only used for Verus bounds checking, dropped in WGSL.
+            if func_name == "slice_subrange" && args.len() == 3 {
+                match &args[0] {
+                    Expr::Var(var) => {
+                        let vn = &ctx.var_names[*var as usize];
+                        if let Some(buf) = ctx.buf_idx(vn) {
+                            return Ok(Expr::BufSlice(buf, Box::new(args[1].clone())));
+                        }
+                        // Vec var: return var + start
+                        return Ok(Expr::BinOp(BinOp::Add,
+                            Box::new(Expr::Var(*var)),
+                            Box::new(args[1].clone())));
+                    },
+                    Expr::BufSlice(buf_id, base_off) => {
+                        return Ok(Expr::BufSlice(*buf_id, Box::new(
+                            Expr::BinOp(BinOp::Add, base_off.clone(), Box::new(args[1].clone()))
+                        )));
+                    },
+                    _ => {
+                        return Ok(Expr::BinOp(BinOp::Add,
+                            Box::new(args[0].clone()),
+                            Box::new(args[1].clone())));
+                    }
                 }
             }
             if func_name == "vslice" && args.len() == 2 {

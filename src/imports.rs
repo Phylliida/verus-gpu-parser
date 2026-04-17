@@ -173,6 +173,11 @@ pub fn extract_functions_from_file(file_path: &Path) -> HashMap<String, String> 
     let mut result = HashMap::new();
     collect_fn_sources(&tree.root_node(), &source, &mut result);
 
+    // Fallback: if tree-sitter produced mostly ERROR nodes (e.g., due to Verus syntax
+    // the grammar doesn't handle), extract exec functions by text matching.
+    // This finds `pub fn name<...>(...) ... { ... }` patterns via brace counting.
+    extract_fn_sources_by_text(&source, &mut result);
+
     // Recursively follow use statements in this file too
     let imports = parse_use_statements(&source);
     let cargo_toml = find_cargo_toml(file_path);
@@ -191,6 +196,67 @@ pub fn extract_functions_from_file(file_path: &Path) -> HashMap<String, String> 
     }
 
     result
+}
+
+/// Fallback function extraction by text matching.
+/// Finds `pub fn name` patterns and extracts the full function body via brace counting.
+/// Skips `proof fn`, `spec fn`, and functions with proof/lemma/axiom prefixes.
+fn extract_fn_sources_by_text(source: &str, result: &mut HashMap<String, String>) {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        // Match lines starting with `pub fn name` (possibly preceded by attributes on prior lines)
+        if (line.starts_with("pub fn ") || line.starts_with("fn "))
+            && !line.contains("proof fn") && !line.contains("spec fn")
+        {
+            // Extract function name
+            let after_fn = if line.starts_with("pub fn ") {
+                &line[7..]
+            } else {
+                &line[3..]
+            };
+            let name_end = after_fn.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(after_fn.len());
+            let name = &after_fn[..name_end];
+            if name.is_empty() || name.starts_with("lemma_") || name.starts_with("proof_")
+                || name.starts_with("axiom_") || name.starts_with("broadcast_")
+            {
+                i += 1;
+                continue;
+            }
+            // Already found by tree-sitter?
+            if result.contains_key(name) {
+                i += 1;
+                continue;
+            }
+            // Collect preceding attribute lines
+            let mut attr_start = i;
+            while attr_start > 0 && lines[attr_start - 1].trim().starts_with("#[") {
+                attr_start -= 1;
+            }
+            // Find the function body by counting braces
+            let fn_start = attr_start;
+            let mut brace_depth = 0i32;
+            let mut found_open = false;
+            let mut fn_end = i;
+            for j in i..lines.len() {
+                for ch in lines[j].chars() {
+                    if ch == '{' { brace_depth += 1; found_open = true; }
+                    if ch == '}' { brace_depth -= 1; }
+                }
+                if found_open && brace_depth <= 0 {
+                    fn_end = j + 1;
+                    break;
+                }
+            }
+            let fn_text: String = lines[fn_start..fn_end].join("\n");
+            eprintln!("    [text_fallback] found: {} (L{}-L{})", name, fn_start + 1, fn_end);
+            result.entry(name.to_string()).or_insert(fn_text);
+            i = fn_end;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Walk a tree-sitter tree and collect function source texts.
