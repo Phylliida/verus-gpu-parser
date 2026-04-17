@@ -11,6 +11,22 @@ use crate::types::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+/// Collect all fn_ids from CallStmt/Call in a statement tree (for debugging).
+fn collect_call_ids(stmt: &Stmt) -> Vec<u32> {
+    let mut ids = Vec::new();
+    collect_call_ids_inner(stmt, &mut ids);
+    ids
+}
+fn collect_call_ids_inner(stmt: &Stmt, ids: &mut Vec<u32>) {
+    match stmt {
+        Stmt::CallStmt { fn_id, .. } => ids.push(*fn_id),
+        Stmt::Seq { first, then } => { collect_call_ids_inner(first, ids); collect_call_ids_inner(then, ids); },
+        Stmt::If { then_body, else_body, .. } => { collect_call_ids_inner(then_body, ids); collect_call_ids_inner(else_body, ids); },
+        Stmt::For { body, .. } => collect_call_ids_inner(body, ids),
+        _ => {},
+    }
+}
+
 /// Remap stale fn_ids in a statement tree.
 fn remap_fn_ids_in_stmt(stmt: &mut Stmt, remap: &HashMap<u32, u32>) {
     match stmt {
@@ -449,6 +465,18 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         fn_id_map.insert(fn_name.clone(), i as u32);
     }
     eprintln!("Reachable: {} functions", reachable.len());
+    for (i, fn_name) in reachable.iter().enumerate() {
+        eprintln!("  [Phase5] fn_id {} = {}", i, fn_name);
+    }
+    eprintln!("Phase 4 fn_name_to_id:");
+    let mut phase4_sorted: Vec<_> = ctx.fn_name_to_id.iter().collect();
+    phase4_sorted.sort_by_key(|(_, &id)| id);
+    for (name, &id) in &phase4_sorted {
+        let new_id = fn_id_map.get(name.as_str());
+        if new_id != Some(&id) {
+            eprintln!("  [Phase4] fn_id {} = {} → Phase5 {:?} MISMATCH", id, name, new_id);
+        }
+    }
 
     // Build old→new fn_id remap from Phase 4 names to Phase 5 indices.
     // Phase 4 parsing assigned local fn_ids (ctx.fn_name_to_id) that may differ
@@ -476,29 +504,13 @@ pub fn parse_gpu_kernel(source: &str, file_path: &str) -> Result<Kernel, String>
         }
     }
 
-    // Remap stale fn_ids in all function bodies.
-    // Phase 5 re-parsing may assign NEW fn_ids for calls that tree-sitter
-    // couldn't parse (e.g., due to Verus-specific syntax). These new ids
-    // are >= functions.len() and need to be remapped to the correct indices.
-    // Build remap from ALL known name→id mappings to the correct fn_id_map indices.
-    {
-        // Collect all stale name→id mappings from Phase 4 AND Phase 5 parsing
-        let mut all_stale_ids: HashMap<u32, u32> = fn_id_remap_old_to_new;
-        // Also check: any fn_id >= functions.len() in any function's fn_name_to_id
-        // is stale and needs remapping
-        for func in &functions {
-            // The function's parsed body may contain Call(stale_id, args)
-            // where stale_id was assigned during re-parsing (Phase 5) for
-            // a callee that wasn't in fn_id_map
-        }
-        // Remap any Call with fn_id >= functions.len() by name lookup
-        let num_fns = functions.len() as u32;
-        for func in &mut functions {
-            remap_fn_ids_in_stmt(&mut func.body, &all_stale_ids);
-            // Also fix out-of-range ids by trying reverse lookup
-            fix_out_of_range_fn_ids(&mut func.body, num_fns, &fn_id_map);
-        }
-    }
+    // NOTE: The old remap pass (Phase 4→5 fn_id remapping) has been removed.
+    // It was needed when Phase 5 re-parsing failed (due to tree-sitter ERROR nodes
+    // from Verus-specific syntax) and Phase 4 stale fn_ids persisted in function bodies.
+    // Now that tree-sitter-verus handles all Verus syntax correctly, Phase 5 re-parsing
+    // succeeds for all functions, so all bodies already have correct Phase 5 fn_ids.
+    // Applying the old remap would CORRUPT fn_ids: if a Phase 5 id happens to equal
+    // a Phase 4 id (for a DIFFERENT function), the remap would change it to the wrong target.
 
     // Phase 6: Re-parse kernel body with final fn_id_map so CallStmt/Call IDs are correct
     let mut final_ctx = ParseCtx {
